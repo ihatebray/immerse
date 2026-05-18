@@ -104,6 +104,30 @@ module.exports = {
       },
     },
   ],
+  // GitHub Releases publisher. `npm run publish` uses this to upload
+  // built installers + the RELEASES/latest.yml metadata files that
+  // electron-updater reads to detect newer versions in-app.
+  //
+  // Requires the GH_TOKEN env var set to a personal access token with
+  // 'repo' scope. Token lives on YOUR dev machine only — never gets
+  // shipped to users (the updater itself reads releases anonymously
+  // from the public repo).
+  //
+  // ⚠️ Replace YOUR_GITHUB_USERNAME with your actual GitHub username
+  // before the first publish, or you'll get a 404 on upload.
+  publishers: [
+    {
+      name: '@electron-forge/publisher-github',
+      config: {
+        repository: {
+          owner: 'ihatebray',
+          name: 'immerse',
+        },
+        draft: false,
+        prerelease: false,
+      },
+    },
+  ],
   plugins: [
     {
       name: '@electron-forge/plugin-vite',

@@ -17979,6 +17979,12 @@ function SettingsTab({
         )}
       </Section>
 
+      {/* Updates — manual "check for updates" affordance for users
+          who don't want to wait for the hourly auto-check, plus current
+          version display. The auto-update toast in App.jsx handles the
+          install-prompt UX; this section is for visibility/control. */}
+      <UpdatesSection />
+
       {/* Library maintenance — re-scan files for fresh metadata. Useful
           after improving the parser or when files have been re-tagged
           externally. */}
@@ -19211,6 +19217,116 @@ function CandidatePickerModal({ open, candidates: initialCandidates, meta, onPic
  * After success, shows a summary ("Removed N tracks · Deleted N files ·
  * Skipped N user-imported") and auto-closes after a beat.
  */
+
+/**
+ * UpdatesSection — Settings panel for the auto-updater. Shows the
+ * current app version and a "Check for updates" button. The actual
+ * "Restart to install" prompt is handled by a toast in App.jsx — this
+ * section is for visibility (what version am I running) and manual
+ * control (check right now instead of waiting for the hourly poll).
+ *
+ * In dev mode (`npm start`), the updater isn't initialized; we show
+ * a small note explaining why the check is unavailable.
+ */
+function UpdatesSection() {
+  const api = typeof window !== 'undefined' ? window.electronAPI : null;
+  const [version, setVersion] = useState('');
+  const [status, setStatus] = useState({ state: 'idle', version: '', progressPct: 0, error: '' });
+
+  useEffect(() => {
+    if (!api) return undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        const v = await api.appGetVersion?.();
+        if (!cancelled && v) setVersion(String(v));
+      } catch { /* ignore */ }
+      try {
+        const s = await api.updateGetStatus?.();
+        if (!cancelled && s) setStatus(s);
+      } catch { /* ignore */ }
+    })();
+    let unsub = null;
+    if (typeof api.onUpdateStatus === 'function') {
+      unsub = api.onUpdateStatus((s) => { if (s) setStatus(s); });
+    }
+    return () => { cancelled = true; if (typeof unsub === 'function') unsub(); };
+  }, [api]);
+
+  const checkNow = async () => {
+    if (!api?.updateCheckNow) return;
+    try { await api.updateCheckNow(); }
+    catch { /* status update will surface error */ }
+  };
+
+  const statusLine = (() => {
+    switch (status.state) {
+      case 'checking': return 'Checking for updates…';
+      case 'no-update': return "You're on the latest version.";
+      case 'available': return `Update v${status.version} available — downloading…`;
+      case 'downloading': return `Downloading update… ${status.progressPct}%`;
+      case 'downloaded': return `Update v${status.version} ready. Restart to install.`;
+      case 'error': return `Couldn't check: ${status.error || 'unknown error'}`;
+      default: return '';
+    }
+  })();
+  const statusColor = status.state === 'error'
+    ? '#f37272'
+    : status.state === 'downloaded' || status.state === 'available'
+      ? '#1db954'
+      : 'rgba(255,255,255,0.55)';
+
+  const installNow = async () => {
+    if (!api?.updateInstall) return;
+    try { await api.updateInstall(); }
+    catch { /* main will quit + relaunch */ }
+  };
+
+  return (
+    <Section title="UPDATES">
+      <div style={{ fontSize: 10.5, color: 'rgba(255,255,255,0.55)', lineHeight: 1.55, marginBottom: 8 }}>
+        Current version:{' '}
+        <code style={{ color: 'rgba(255,255,255,0.85)' }}>{version || '—'}</code>
+        {'  ·  '}
+        Updates download in the background; you'll see a "Restart" toast when one's ready.
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <button
+          type="button"
+          onClick={checkNow}
+          disabled={status.state === 'checking' || status.state === 'downloading'}
+          style={{
+            padding: '6px 14px', borderRadius: 9,
+            border: '1px solid rgba(255,255,255,0.15)',
+            background: 'rgba(255,255,255,0.06)', color: '#fff',
+            fontSize: 11.5, fontWeight: 600,
+            cursor: (status.state === 'checking' || status.state === 'downloading') ? 'wait' : 'pointer',
+            opacity: (status.state === 'checking' || status.state === 'downloading') ? 0.6 : 1,
+          }}
+        >
+          {status.state === 'checking' ? 'Checking…' : 'Check for updates'}
+        </button>
+        {status.state === 'downloaded' ? (
+          <button
+            type="button"
+            onClick={installNow}
+            style={{
+              padding: '6px 14px', borderRadius: 9,
+              border: '1px solid rgba(29,185,84,0.35)',
+              background: 'rgba(29,185,84,0.18)', color: '#1db954',
+              fontSize: 11.5, fontWeight: 700, cursor: 'pointer',
+            }}
+          >
+            Restart &amp; install
+          </button>
+        ) : null}
+        {statusLine ? (
+          <span style={{ fontSize: 10.5, color: statusColor }}>{statusLine}</span>
+        ) : null}
+      </div>
+    </Section>
+  );
+}
 
 /**
  * RescanMetadataButton — sends a library:rescanMetadata IPC to the main

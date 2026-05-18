@@ -51,6 +51,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   spotifyUserAuthState: () => ipcRenderer.invoke('spotify:userAuthState'),
   spotifyDisconnectUser: () => ipcRenderer.invoke('spotify:disconnectUser'),
   spotifyGetMyPlaylists: () => ipcRenderer.invoke('spotify:getMyPlaylists'),
+  // Auto-updater
+  updateCheckNow: () => ipcRenderer.invoke('update:checkNow'),
+  updateInstall: () => ipcRenderer.invoke('update:install'),
+  updateGetStatus: () => ipcRenderer.invoke('update:getStatus'),
+  onUpdateStatus: (cb) => {
+    const listener = (_e, payload) => cb(payload);
+    ipcRenderer.on('update:status', listener);
+    return () => ipcRenderer.removeListener('update:status', listener);
+  },
+  appGetVersion: () => ipcRenderer.invoke('app:getVersion'),
   onSpotifyUserAuthChanged: (cb) => {
     const listener = (_event, payload) => cb(payload);
     ipcRenderer.on('spotify:userAuthChanged', listener);

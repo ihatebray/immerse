@@ -6,6 +6,7 @@ import {
   presetById,
   loadGoogleFontForPreset,
 } from './uiFonts.js';
+import { useToastBus, ToastStack } from './Toasts.jsx';
 
 function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -83,6 +84,59 @@ export default function App() {
   const [library, setLibrary] = useState([]);
   const [libraryBootstrapped, setLibraryBootstrapped] = useState(() => typeof window === 'undefined' || !window.electronAPI);
   const [playlists, setPlaylists] = useState([]);
+
+  // Global toast bus — used by the auto-updater (and anywhere else that
+  // needs to surface a transient confirmation/error from the app shell).
+  const { toasts, pushToast, dismissToast } = useToastBus();
+
+  // Auto-updater state. Driven by 'update:status' events from the main
+  // process. Initial fetch on mount in case the updater already had a
+  // status before this component mounted (rare but possible if the
+  // renderer hot-reloads).
+  const [updaterStatus, setUpdaterStatus] = useState({ state: 'idle', version: '', progressPct: 0, error: '' });
+  const updateToastIdRef = useRef(null);
+
+  useEffect(() => {
+    const api = typeof window !== 'undefined' ? window.electronAPI : null;
+    if (!api?.onUpdateStatus) return undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        const s = await api.updateGetStatus?.();
+        if (!cancelled && s) setUpdaterStatus(s);
+      } catch { /* ignore */ }
+    })();
+    const unsub = api.onUpdateStatus((s) => {
+      if (!s) return;
+      setUpdaterStatus(s);
+      // Surface the "ready to install" prompt as a toast with an action
+      // button. Push exactly once per download cycle by tracking the
+      // toast id; if a second 'downloaded' event arrives (shouldn't,
+      // but defensive), we won't stack duplicates.
+      if (s.state === 'downloaded' && !updateToastIdRef.current) {
+        const id = pushToast({
+          message: `Update ready${s.version ? ` (v${s.version})` : ''}. Restart to install.`,
+          kind: 'info',
+          durationMs: 0, // 0 = no auto-dismiss; user has to click
+          action: {
+            label: 'Restart',
+            handler: () => {
+              try { api.updateInstall?.(); }
+              catch { /* main quits us regardless */ }
+            },
+          },
+        });
+        updateToastIdRef.current = id;
+      }
+      // Reset the toast tracker on any non-downloaded state so a future
+      // check + download will be allowed to toast again.
+      if (s.state !== 'downloaded' && updateToastIdRef.current) {
+        updateToastIdRef.current = null;
+      }
+    });
+    return () => { cancelled = true; if (typeof unsub === 'function') unsub(); };
+  }, [pushToast]);
+
   /** Recent releases (within last 30 days) for followed artists — cached server-side. */
   const [releases, setReleases] = useState([]);
   /** Manual follow-overrides: [{ artistName, action: 'add' | 'exclude', itunesArtistId }]. */
@@ -2470,6 +2524,10 @@ export default function App() {
           playTrack(albumTracks[0], albumTracks);
         }}
       />
+      {/* Global toast stack — used by the auto-updater and any other
+          app-shell notification path. Pinned to bottom-right above the
+          player chrome. */}
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </div>
   );
 }
