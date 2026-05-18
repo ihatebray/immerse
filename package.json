@@ -1,6 +1,6 @@
 {
   "name": "immerse",
-  "version": "1.0.1",
+  "version": "1.0.3",
   "description": "Immersive — local music player",
   "author": "bray",
   "main": ".vite/build/main.js",
@@ -26,13 +26,13 @@
   },
   "dependencies": {
     "@ryuziii/discord-rpc": "^1.0.1-rc.1",
-    "electron-updater": "^6.3.9",
     "music-metadata": "^7.14.0",
     "node-id3": "^0.2.9",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "soulseek-ts": "^2.1.4",
-    "sql.js": "^1.14.1"
+    "sql.js": "^1.14.1",
+    "update-electron-app": "^3.1.1"
   },
   "overrides": {
     "soulseek-ts": {
