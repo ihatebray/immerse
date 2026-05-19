@@ -712,6 +712,18 @@ export async function updateTrackMetadata(id, fields) {
     sets.push('disc_number = ?');
     args.push(v);
   }
+  if ('explicit' in fields) {
+    // Explicit flag is stored as INTEGER 0/1/null (see schema in
+    // ensureLibraryOpen above). Accept boolean true/false from callers
+    // and convert; null means "unknown" and clears the column.
+    let v = null;
+    if (fields.explicit === true) v = 1;
+    else if (fields.explicit === false) v = 0;
+    else if (fields.explicit == null) v = null;
+    else return { ok: false, error: 'Explicit must be boolean or null.' };
+    sets.push('explicit = ?');
+    args.push(v);
+  }
   if ('coverArt' in fields) {
     let cover_art_url = null;
     const raw = fields.coverArt;

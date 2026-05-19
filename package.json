@@ -1,6 +1,6 @@
 {
   "name": "immerse",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Immersive — local music player",
   "author": "bray",
   "main": ".vite/build/main.js",

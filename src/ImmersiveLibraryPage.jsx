@@ -30,6 +30,43 @@ function formatDurationMs(ms) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
+/**
+ * Friendly file-format label from a file path (or any filename).
+ * Returns the extension upper-cased and lightly normalized so users see
+ * "FLAC" / "MP3" / "M4A" rather than ".flac" or "x-aac".
+ *
+ * Used in:
+ *   - The Track tab's DETAILS section (read-only "Format" row)
+ *   - The Metadata Editor's footer (read-only, since the format isn't
+ *     editable — it's a property of the file on disk)
+ *
+ * Returns empty string if there's no path or no extension, so callers
+ * can conditionally hide the row when format is unknown.
+ *
+ * A handful of legacy/lookalike extensions get normalized (M4A and AAC
+ * map to "M4A" since that's what users actually call the container).
+ * Everything else falls through as uppercase letters.
+ */
+function getFileFormatLabel(filePath) {
+  if (!filePath || typeof filePath !== 'string') return '';
+  // Strip any query / hash, take the segment after the last dot.
+  const cleaned = filePath.split(/[?#]/)[0];
+  const dot = cleaned.lastIndexOf('.');
+  if (dot < 0 || dot === cleaned.length - 1) return '';
+  const ext = cleaned.slice(dot + 1).toLowerCase();
+  // Skip obvious non-audio extensions silently — happens for streaming
+  // imports that briefly use temp paths during download.
+  if (ext.length > 6 || /[^a-z0-9]/i.test(ext)) return '';
+  const aliases = {
+    aac: 'M4A',
+    mp4: 'M4A',
+    aiff: 'AIFF',
+    aif: 'AIFF',
+    oga: 'OGG',
+  };
+  return aliases[ext] || ext.toUpperCase();
+}
+
 /** Parse LRC "[mm:ss.xx] text" into sorted array of { time, text }. */
 /**
  * Parse an LRC-format synced lyrics string into a sorted array of
@@ -155,6 +192,7 @@ export default function ImmersiveLibraryPage({
   uiFontStack,
   spotifyCredsRefreshKey,
   onSpotifyCredsSaved,
+  onOpenTutorial,
   onPlayTrack,
   onPlayPauseTrack,
   onTogglePlay,
@@ -1829,6 +1867,7 @@ export default function ImmersiveLibraryPage({
       <SideDock
         collapsed={dockCollapsed}
         onToggleCollapsed={() => setDockCollapsed((v) => !v)}
+        onOpenTutorial={onOpenTutorial}
         side={dockSide}
         tab={dockTab}
         onTabChange={setDockTab}
@@ -2641,7 +2680,30 @@ function MetadataEditor({ track, onSave, onClose, accent }) {
           display: 'flex', gap: 8, padding: '12px 16px 14px',
           borderTop: '1px solid rgba(255,255,255,0.06)',
           background: 'rgba(0,0,0,0.15)',
+          alignItems: 'center',
         }}>
+          {/* Read-only file format pill. Not editable — it's a property
+              of the file on disk, derived from the path extension. The
+              underlying audio file type isn't something the user can
+              change without re-encoding, so we surface it for awareness
+              rather than for editing. */}
+          {(() => {
+            const fmt = getFileFormatLabel(track.filePath);
+            return fmt ? (
+              <div title={`Audio file format: ${fmt}`}
+                style={{
+                  padding: '4px 9px', borderRadius: 7,
+                  fontSize: 10, fontWeight: 700, letterSpacing: 0.4,
+                  background: 'rgba(255,255,255,0.04)',
+                  border: '1px solid rgba(255,255,255,0.08)',
+                  color: 'rgba(255,255,255,0.55)',
+                  whiteSpace: 'nowrap',
+                  fontFamily: 'ui-monospace, SF Mono, Menlo, Consolas, monospace',
+                }}>
+                {fmt}
+              </div>
+            ) : null;
+          })()}
           <button type="button" onClick={onClose}
             style={{
               flex: 1, padding: '8px 14px', borderRadius: 9,
@@ -5882,22 +5944,22 @@ function NavRail({
           remaining tabs accept right-click for a hide action. Library and
           Settings are protected (always visible). */}
       {!(pinnableTabsEnabled && hiddenTabIds.includes('find')) ? (
-        <NavRailIcon active={tab === 'find' && panelOpen} onClick={() => handleTabClick('find')} title="Find" onContextMenu={tabContextHandler('find')}>
+        <NavRailIcon active={tab === 'find' && panelOpen} onClick={() => handleTabClick('find')} title="Find" onContextMenu={tabContextHandler('find')} tutorialId="dock-find">
           <Icons.Search />
         </NavRailIcon>
       ) : null}
-      <NavRailIcon active={tab === 'library' && panelOpen} onClick={() => handleTabClick('library')} title={`Library · ${libraryCount}`}>
+      <NavRailIcon active={tab === 'library' && panelOpen} onClick={() => handleTabClick('library')} title={`Library · ${libraryCount}`} tutorialId="dock-library">
         <Icons.LibrarySidebar />
       </NavRailIcon>
       {!(pinnableTabsEnabled && hiddenTabIds.includes('new')) ? (
-        <NavRailIcon active={tab === 'new' && panelOpen} onClick={() => handleTabClick('new')} title="New releases" onContextMenu={tabContextHandler('new')}>
+        <NavRailIcon active={tab === 'new' && panelOpen} onClick={() => handleTabClick('new')} title="New releases" onContextMenu={tabContextHandler('new')} tutorialId="dock-new">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
             <path d="M10 2 L11.3 8 L17 9.3 L11.3 10.6 L10 16.6 L8.7 10.6 L3 9.3 L8.7 8 Z" />
             <path d="M17.5 14 L18.2 17 L21 17.6 L18.2 18.2 L17.5 21.2 L16.8 18.2 L14 17.6 L16.8 17 Z" />
           </svg>
         </NavRailIcon>
       ) : null}
-      <NavRailIcon active={tab === 'settings' && panelOpen} onClick={() => handleTabClick('settings')} title="Settings">
+      <NavRailIcon active={tab === 'settings' && panelOpen} onClick={() => handleTabClick('settings')} title="Settings" tutorialId="dock-settings">
         <Icons.Settings />
       </NavRailIcon>
     </aside>
@@ -5909,7 +5971,7 @@ function NavRail({
  * RailIcon, with a clearer active state (accent-tinted background + left
  * inset bar to emphasize "active tab").
  */
-function NavRailIcon({ active, onClick, title, children, onContextMenu }) {
+function NavRailIcon({ active, onClick, title, children, onContextMenu, tutorialId }) {
   const [hovered, setHovered] = useState(false);
   return (
     <button
@@ -5918,6 +5980,7 @@ function NavRailIcon({ active, onClick, title, children, onContextMenu }) {
       onContextMenu={onContextMenu}
       title={title}
       aria-label={title}
+      data-tutorial-target={tutorialId}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       style={{
@@ -6293,15 +6356,15 @@ function BottomDockBar({
         </div>
       ) : null}
       {!(pinnableTabsEnabled && hiddenTabIds.includes('find')) ? (
-        <BottomDockBtn active={tab === 'find' && panelOpen} onClick={() => handleTabClick('find')} title="Find" onContextMenu={tabContextHandler('find')}>
+        <BottomDockBtn active={tab === 'find' && panelOpen} onClick={() => handleTabClick('find')} title="Find" onContextMenu={tabContextHandler('find')} tutorialId="dock-find">
           <Icons.Search />
         </BottomDockBtn>
       ) : null}
-      <BottomDockBtn active={tab === 'library' && panelOpen} onClick={() => handleTabClick('library')} title={`Library · ${libraryCount}`}>
+      <BottomDockBtn active={tab === 'library' && panelOpen} onClick={() => handleTabClick('library')} title={`Library · ${libraryCount}`} tutorialId="dock-library">
         <Icons.LibrarySidebar />
       </BottomDockBtn>
       {!(pinnableTabsEnabled && hiddenTabIds.includes('new')) ? (
-        <BottomDockBtn active={tab === 'new' && panelOpen} onClick={() => handleTabClick('new')} title="New releases" onContextMenu={tabContextHandler('new')}>
+        <BottomDockBtn active={tab === 'new' && panelOpen} onClick={() => handleTabClick('new')} title="New releases" onContextMenu={tabContextHandler('new')} tutorialId="dock-new">
           {/* Two-star sparkle. Both stars enlarged + slightly thicker so the
               silhouette fills the 14px bounding box like the other icons.
               Previous version was smaller because the star paths only used
@@ -6314,11 +6377,11 @@ function BottomDockBar({
           </svg>
         </BottomDockBtn>
       ) : null}
-      <BottomDockBtn active={tab === 'settings' && panelOpen} onClick={() => handleTabClick('settings')} title="Settings">
+      <BottomDockBtn active={tab === 'settings' && panelOpen} onClick={() => handleTabClick('settings')} title="Settings" tutorialId="dock-settings">
         <Icons.Settings />
       </BottomDockBtn>
       {!(pinnableTabsEnabled && hiddenTabIds.includes('stats')) ? (
-        <BottomDockBtn active={tab === 'stats' && panelOpen} onClick={() => handleTabClick('stats')} title="Listening stats" onContextMenu={tabContextHandler('stats')}>
+        <BottomDockBtn active={tab === 'stats' && panelOpen} onClick={() => handleTabClick('stats')} title="Listening stats" onContextMenu={tabContextHandler('stats')} tutorialId="dock-stats">
           {/* Bar chart with three bars of varying height — universal "stats /
               data" glyph. Distinct from the other icons in the row. */}
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -6330,7 +6393,7 @@ function BottomDockBar({
         </BottomDockBtn>
       ) : null}
       {journalTabEnabled && !(pinnableTabsEnabled && hiddenTabIds.includes('journal')) ? (
-        <BottomDockBtn active={tab === 'journal' && panelOpen} onClick={() => handleTabClick('journal')} title="Listening journal" onContextMenu={tabContextHandler('journal')}>
+        <BottomDockBtn active={tab === 'journal' && panelOpen} onClick={() => handleTabClick('journal')} title="Listening journal" onContextMenu={tabContextHandler('journal')} tutorialId="dock-journal">
           {/* Open-book glyph — distinguishes the diary view from Stats
               (numbers) and Queue (list). Two facing pages with a spine
               groove down the middle. */}
@@ -6359,6 +6422,7 @@ function BottomDockBar({
           onContextMenu={tabContextHandler('track')}
           title="About this track"
           accent={accent}
+          tutorialId="dock-track"
         >
           {/* "Info" glyph — circle with an i. Universally recognised; pairs
               cleanly with the bar-chart Stats icon and the dice Random
@@ -6447,6 +6511,7 @@ function BottomDockBar({
           title={queueCount > 0 ? `Queue · ${queueCount}` : 'Queue'}
           badge={queueCount > 0 ? queueCount : null}
           accent={accent}
+          tutorialId="dock-queue"
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
             <line x1="8" y1="6" x2="21" y2="6" />
@@ -6730,7 +6795,7 @@ function RecentPeekPopover({ library = [], playEvents = [], range = '5', customC
 }
 
 
-function BottomDockBtn({ active, onClick, title, children, badge = null, accent = '48, 48, 48', disabled = false, onContextMenu }) {
+function BottomDockBtn({ active, onClick, title, children, badge = null, accent = '48, 48, 48', disabled = false, onContextMenu, tutorialId }) {
   const [hovered, setHovered] = useState(false);
   // Bottom dock bar is anchored at the bottom of the window — tooltips
   // would clip off-screen if they appeared below. Force above.
@@ -6744,6 +6809,7 @@ function BottomDockBtn({ active, onClick, title, children, badge = null, accent 
         // Keep aria-label for accessibility (screen readers); the visual
         // tooltip replaces the native title="" hover behavior.
         aria-label={title}
+        data-tutorial-target={tutorialId}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
         style={{
@@ -6875,6 +6941,10 @@ function PanelResizeHandle({ side, currentWidth, onCommitWidth }) {
 function SideDock({
   collapsed,
   onToggleCollapsed,
+  // Tutorial trigger — passed through from ImmersiveLibraryPage so the
+  // SettingsTab rendered inside this component can wire its
+  // "Open tutorial" button.
+  onOpenTutorial,
   tab,
   onTabChange,
   tracks,
@@ -7392,6 +7462,7 @@ function SideDock({
             onSetDockSide={onSetSide}
             contextMenusEnabled={contextMenusEnabled}
             onSetContextMenusEnabled={onSetContextMenusEnabled}
+            onOpenTutorial={onOpenTutorial}
           />
         ) : tab === 'stats' ? (
           <StatsTab
@@ -15144,6 +15215,14 @@ function TrackTab({
       <TrackTabSection title="DETAILS" accent={accent}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <TrackStatRow label="Duration" value={formatDuration(currentTrack.duration)} />
+          {(() => {
+            // File format (FLAC / MP3 / M4A / etc.) derived from the
+            // file extension. Renders only if we can identify the
+            // format; streaming-temp paths return '' and we suppress
+            // the row.
+            const fmt = getFileFormatLabel(currentTrack.filePath);
+            return fmt ? <TrackStatRow label="Format" value={fmt} /> : null;
+          })()}
           {currentTrack.year ? <TrackStatRow label="Year" value={String(currentTrack.year)} /> : null}
           {currentTrack.genre ? <TrackStatRow label="Genre" value={currentTrack.genre} /> : null}
           {currentTrack.trackNumber ? (
@@ -17075,6 +17154,7 @@ function SettingsTab({
   onSetUiFontId,
   uiFontStack,
   onSpotifyCredsSaved,
+  onOpenTutorial,
   animateGradient = true,
   onSetAnimateGradient,
   beatReactive = false,
@@ -17676,12 +17756,6 @@ function SettingsTab({
           onChange={(v) => onSetLiquidGlassDockEnabled?.(v)}
         />
         <ToggleRow
-          label="Listening journal tab"
-          description="Adds a Journal tab to the dock. Browse your play history day by day with auto-generated prose summaries and stat cards. Reads from your existing play events; nothing extra recorded."
-          checked={journalTabEnabled}
-          onChange={(v) => onSetJournalTabEnabled?.(v)}
-        />
-        <ToggleRow
           label="Queue painter view"
           description="Adds a list/painter switch to the Queue tab. Painter mode shows the queue as a horizontal duration-proportional strip so you can see at a glance how long until the next track plays."
           checked={queuePainterEnabled}
@@ -17976,11 +18050,35 @@ function SettingsTab({
           install-prompt UX; this section is for visibility/control. */}
       <UpdatesSection />
 
+      {/* Tutorial — replays the first-run walkthrough on demand. */}
+      {typeof onOpenTutorial === 'function' ? (
+        <Section title="TUTORIAL">
+          <div style={{ fontSize: 10.5, color: 'rgba(255,255,255,0.55)', lineHeight: 1.55, marginBottom: 10 }}>
+            Walks you through what each button in the dock does. Useful
+            if you've forgotten what a tab is for, or want to remind
+            yourself how to navigate.
+          </div>
+          <button
+            type="button"
+            onClick={onOpenTutorial}
+            style={{
+              padding: '6px 14px', borderRadius: 9,
+              border: '1px solid rgba(29,185,84,0.35)',
+              background: 'rgba(29,185,84,0.18)', color: '#1db954',
+              fontSize: 11.5, fontWeight: 700, cursor: 'pointer',
+            }}
+          >
+            Open tutorial
+          </button>
+        </Section>
+      ) : null}
+
       {/* Library maintenance — re-scan files for fresh metadata. Useful
           after improving the parser or when files have been re-tagged
           externally. */}
       <Section title="LIBRARY MAINTENANCE">
         <RescanMetadataButton onReloadLibrary={onReloadLibrary} />
+        <RescanExplicitButton onReloadLibrary={onReloadLibrary} />
       </Section>
 
       {/* Danger zone — only exposed if the IPC is available (Electron) */}
@@ -19412,18 +19510,25 @@ function UpdatesSection() {
     let cancelled = false;
     (async () => {
       try {
-        const v = await api.appGetVersion?.();
-        if (!cancelled && v) setVersion(String(v));
+        if (typeof api.appGetVersion === 'function') {
+          const v = await api.appGetVersion();
+          if (!cancelled && v) setVersion(String(v));
+        }
       } catch { /* ignore */ }
       try {
-        const s = await api.updateGetStatus?.();
-        if (!cancelled && s) setStatus(s);
+        if (typeof api.updateGetStatus === 'function') {
+          const s = await api.updateGetStatus();
+          if (!cancelled && s && typeof s === 'object') setStatus(s);
+        }
       } catch { /* ignore */ }
     })();
     let unsub = null;
-    if (typeof api.onUpdateStatus === 'function') {
-      unsub = api.onUpdateStatus((s) => { if (s) setStatus(s); });
-    }
+    try {
+      if (typeof api.onUpdateStatus === 'function') {
+        const maybeUnsub = api.onUpdateStatus((s) => { if (s && typeof s === 'object') setStatus(s); });
+        if (typeof maybeUnsub === 'function') unsub = maybeUnsub;
+      }
+    } catch { /* ignore */ }
     return () => { cancelled = true; if (typeof unsub === 'function') unsub(); };
   }, [api]);
 
@@ -19630,6 +19735,145 @@ function RescanMetadataButton({ onReloadLibrary }) {
               {result.failed > 0 ? <> · <span style={{ color: 'rgba(243,114,114,0.85)' }}>{result.failed} failed</span></> : null}
               .
             </>
+          ) : (
+            <>Re-scan failed: {result.error || 'unknown error'}</>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * RescanExplicitButton — backfills explicit flags from Spotify for any
+ * library track whose explicit field isn't currently a boolean (typically
+ * tracks imported via manual Soulseek search before the explicit-flag
+ * fix landed in v1.0.5).
+ *
+ * Same shape as RescanMetadataButton: button → live progress → result
+ * summary. The heavy lifting is done in main.js (library:rescanExplicit)
+ * which loops candidates, runs spotifyCrossCheck, and writes updates.
+ *
+ * Requires Spotify credentials. If they aren't configured we still
+ * render the button — main.js returns a friendly error explaining what
+ * to set up.
+ */
+function RescanExplicitButton({ onReloadLibrary }) {
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState(null);
+  const [result, setResult] = useState(null);
+
+  const api = typeof window !== 'undefined' ? window.electronAPI : null;
+  const available = !!(api && typeof api.rescanExplicit === 'function');
+
+  const handleClick = async () => {
+    if (!available || busy) return;
+    setBusy(true);
+    setResult(null);
+    setProgress({ scanned: 0, total: 0, updated: 0, failed: 0 });
+
+    let unsub = null;
+    if (typeof api.onRescanExplicitProgress === 'function') {
+      unsub = api.onRescanExplicitProgress((p) => {
+        if (p) setProgress(p);
+      });
+    }
+
+    let r;
+    try { r = await api.rescanExplicit(); }
+    catch (e) { r = { ok: false, error: String(e?.message || e) }; }
+
+    if (typeof unsub === 'function') unsub();
+
+    setBusy(false);
+    setResult(r);
+
+    if (r?.ok && typeof onReloadLibrary === 'function') {
+      try { await onReloadLibrary(); } catch { /* ignore */ }
+    }
+  };
+
+  if (!available) {
+    return (
+      <div style={{ fontSize: 10.5, color: 'rgba(255,255,255,0.4)', fontStyle: 'italic' }}>
+        Re-scan only works in the desktop app.
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ marginTop: 14 }}>
+      <div style={{
+        fontSize: 10.5, color: 'rgba(255,255,255,0.55)',
+        lineHeight: 1.55, marginBottom: 10,
+      }}>
+        Re-check every track in your library against Spotify and backfill
+        the explicit flag for songs that were missing it. Useful for
+        songs imported via manual Soulseek search before the fix.
+      </div>
+      <button
+        type="button"
+        onClick={handleClick}
+        disabled={busy}
+        style={{
+          width: '100%', padding: '9px 12px', borderRadius: 9,
+          border: '1px solid rgba(255,255,255,0.10)',
+          background: busy ? 'rgba(255,255,255,0.04)' : 'rgba(255,255,255,0.06)',
+          color: 'rgba(255,255,255,0.85)',
+          fontSize: 11.5, fontWeight: 600,
+          cursor: busy ? 'default' : 'pointer',
+          transition: 'background 0.15s',
+        }}
+        onMouseEnter={(e) => { if (!busy) e.currentTarget.style.background = 'rgba(255,255,255,0.10)'; }}
+        onMouseLeave={(e) => { if (!busy) e.currentTarget.style.background = 'rgba(255,255,255,0.06)'; }}
+      >
+        {busy ? 'Re-scanning…' : 'Re-scan explicit flags'}
+      </button>
+
+      {busy && progress ? (
+        <div style={{ marginTop: 10 }}>
+          <div style={{
+            height: 4, borderRadius: 2,
+            background: 'rgba(255,255,255,0.06)', overflow: 'hidden',
+          }}>
+            <div style={{
+              height: '100%',
+              width: progress.total > 0
+                ? `${Math.min(100, (progress.scanned / progress.total) * 100)}%`
+                : '0%',
+              background: 'rgba(255,255,255,0.4)',
+              transition: 'width 0.2s',
+            }} />
+          </div>
+          <div style={{
+            marginTop: 6, fontSize: 10,
+            color: 'rgba(255,255,255,0.45)',
+            display: 'flex', justifyContent: 'space-between', gap: 8,
+            fontVariantNumeric: 'tabular-nums',
+          }}>
+            <span>{progress.scanned} / {progress.total}</span>
+            <span>{progress.updated} updated · {progress.failed} failed</span>
+          </div>
+        </div>
+      ) : null}
+
+      {!busy && result ? (
+        <div style={{
+          marginTop: 10, padding: '8px 10px', borderRadius: 7,
+          background: result.ok ? 'rgba(80,180,120,0.08)' : 'rgba(243,114,114,0.08)',
+          border: `1px solid ${result.ok ? 'rgba(80,180,120,0.2)' : 'rgba(243,114,114,0.25)'}`,
+          fontSize: 11, color: 'rgba(255,255,255,0.85)', lineHeight: 1.5,
+        }}>
+          {result.ok ? (
+            result.total === 0 ? (
+              <>Nothing to do — every track in your library already has an explicit flag set.</>
+            ) : (
+              <>
+                Updated <strong>{result.updated}</strong> of <strong>{result.total}</strong> candidate tracks
+                {result.failed > 0 ? <> · <span style={{ color: 'rgba(243,114,114,0.85)' }}>{result.failed} no match</span></> : null}
+                .
+              </>
+            )
           ) : (
             <>Re-scan failed: {result.error || 'unknown error'}</>
           )}
@@ -20524,7 +20768,6 @@ function DockTabVisibilityList({ hiddenTabIds = [], onSetHiddenTabIds }) {
     { id: 'new',    label: 'New releases',   desc: 'Recent releases from artists you follow.' },
     { id: 'stats',  label: 'Listening stats', desc: 'Top tracks, artists, listening time.' },
     { id: 'queue',  label: 'Queue',          desc: 'Up-next tracks for the current session.' },
-    { id: 'journal', label: 'Journal',        desc: 'Day-by-day diary of your play history with prose summaries.' },
     { id: 'lyrics', label: 'Lyrics',         desc: 'Show/hide the lyrics side panel during playback.' },
   ];
 

@@ -158,6 +158,49 @@ export default function App() {
     try { await api.whatsnewSetLastSeen(whatsNewData.version); } catch { /* ignore */ }
   }, [whatsNewData]);
 
+  // First-run tutorial. Auto-shows once after the first launch ever
+  // (unless the user is mid-update, in which case the What's New
+  // overlay handles their introduction). Settings has an "Open tutorial"
+  // button that triggers it anytime regardless of the seen flag.
+  //
+  // We DON'T auto-show alongside the What's New overlay — if the user
+  // is updating, they already know the app, no point repeating the
+  // tour. The auto-show only fires when whatsNewOpen is false AND
+  // tutorialSeen is false. The check happens once on mount with a
+  // small delay so the dock has time to render and our spotlight
+  // measurements are accurate.
+  const [tutorialOpen, setTutorialOpen] = useState(false);
+
+  useEffect(() => {
+    const api = typeof window !== 'undefined' ? window.electronAPI : null;
+    if (!api?.tutorialGetSeen) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await api.tutorialGetSeen();
+        if (cancelled) return;
+        // Wait a beat so the dock has settled into its final position
+        // before we measure for spotlights. The whats-new overlay also
+        // takes precedence — we don't want both modals at once.
+        setTimeout(() => {
+          if (cancelled) return;
+          if (!r?.seen && !whatsNewOpen) setTutorialOpen(true);
+        }, 600);
+      } catch { /* ignore */ }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // run once on mount
+
+  const dismissTutorial = useCallback(async () => {
+    setTutorialOpen(false);
+    const api = typeof window !== 'undefined' ? window.electronAPI : null;
+    if (!api?.tutorialSetSeen) return;
+    try { await api.tutorialSetSeen(true); } catch { /* ignore */ }
+  }, []);
+
+  const openTutorial = useCallback(() => setTutorialOpen(true), []);
+
   useEffect(() => {
     const api = typeof window !== 'undefined' ? window.electronAPI : null;
     if (!api?.onUpdateStatus) return undefined;
@@ -527,18 +570,17 @@ export default function App() {
   // play events with auto-generated prose summaries and stat cards.
   // Drawn entirely from existing `playEvents` + `library`; no DB
   // additions needed.
-  const [journalTabEnabled, setJournalTabEnabled] = useState(() => {
-    try {
-      return typeof window !== 'undefined'
-        && window.localStorage.getItem('immerse:dev:journalTab') === '1';
-    } catch { return false; }
-  });
+  // Journal tab removed in v1.0.5. State + setter retained as a noop to
+  // avoid invasive changes to all the props that referenced them, but
+  // the value is now permanently false and the setter is a no-op so the
+  // journal tab can never appear regardless of prior localStorage state.
+  // Also proactively clears the localStorage flag so future versions
+  // don't accidentally re-enable it.
+  const journalTabEnabled = false;
+  const setJournalTabEnabled = () => {};
   useEffect(() => {
-    try {
-      if (journalTabEnabled) window.localStorage.setItem('immerse:dev:journalTab', '1');
-      else window.localStorage.removeItem('immerse:dev:journalTab');
-    } catch { /* ignore */ }
-  }, [journalTabEnabled]);
+    try { window.localStorage.removeItem('immerse:dev:journalTab'); } catch { /* ignore */ }
+  }, []);
 
   // Queue Painter — when enabled, the Queue tab gains a view-mode switch
   // (list / painter). Painter mode shows the queue as a horizontal
@@ -2370,6 +2412,7 @@ export default function App() {
         uiFontStack={uiFontStack}
         spotifyCredsRefreshKey={spotifyCredsRefreshKey}
         onSpotifyCredsSaved={handleSpotifyCredsSaved}
+        onOpenTutorial={openTutorial}
         onPlayTrack={playTrack}
         onPlayPauseTrack={playPauseLibraryRow}
         onTogglePlay={togglePlay}
@@ -2600,6 +2643,11 @@ export default function App() {
           data={whatsNewData}
           onClose={dismissWhatsNew}
         />
+      ) : null}
+      {/* First-run / on-demand tutorial. Has its own z-index above the
+          dock and ToastStack so it sits on top of everything. */}
+      {tutorialOpen ? (
+        <Tutorial onClose={dismissTutorial} />
       ) : null}
     </div>
   );
@@ -3022,6 +3070,548 @@ function renderInline(text) {
   }
   return out;
 }
+
+/**
+ * Tutorial — first-run walkthrough of the dock. Shows a spotlight on
+ * each dock button in turn, with a tooltip card explaining what the
+ * button does and how to use it.
+ *
+ * Steps are declared up front; each step has:
+ *   - target: a CSS selector that resolves to the element to spotlight
+ *             (we use data-tutorial-target="..." attributes on dock
+ *             icons to avoid relying on DOM structure)
+ *   - title: short header
+ *   - body: description text or React nodes
+ *
+ * If a target can't be found (e.g. the user hid that tab), the step
+ * gracefully degrades to a centered card with no spotlight. The "Next"
+ * button still works — we don't strand the user on an unreachable step.
+ *
+ * Tooltip placement: we compute the spotlight rect and place the tooltip
+ * on whichever side has the most viewport room. Constrains to viewport
+ * with a small margin so the tooltip never clips off-screen.
+ */
+function Tutorial({ onClose }) {
+  const [stepIdx, setStepIdx] = useState(0);
+  const [targetRect, setTargetRect] = useState(null);
+  const overlayRef = useRef(null);
+
+  // Step content. Order is intentional — we walk the dock left-to-right
+  // (or top-to-bottom depending on dock orientation, but the order is
+  // the same either way): primary tabs first (Find/Library/New/Settings),
+  // then secondary (Stats/Journal), then context tabs (Track/Queue).
+  const steps = useMemo(() => [
+    {
+      target: null, // welcome card, no spotlight
+      title: 'Welcome to Immerse',
+      body: (
+        <>
+          Quick tour of the dock — the panel on the side (or bottom) of
+          the window. Each button opens a different view of your library
+          and tools. Use{' '}
+          <kbd style={kbdStyle}>Next</kbd> to step through, or{' '}
+          <kbd style={kbdStyle}>Skip</kbd> to dismiss. You can reopen
+          this tutorial anytime from Settings.
+        </>
+      ),
+    },
+    {
+      target: '[data-tutorial-target="dock-find"]',
+      title: 'Find',
+      body: (
+        <>
+          Search Spotify for tracks and albums, or find files on Soulseek.
+          You can also import your own Spotify playlists here — handy
+          when you're rebuilding your library from a service.
+        </>
+      ),
+    },
+    {
+      target: '[data-tutorial-target="dock-library"]',
+      title: 'Library',
+      body: (
+        <>
+          Everything you own, in one place. Browse by track, album, or
+          artist. Click any row to play; right-click for more options
+          like editing metadata, adding to playlists, or removing.
+        </>
+      ),
+    },
+    {
+      target: '[data-tutorial-target="dock-new"]',
+      title: 'New releases',
+      body: (
+        <>
+          Latest releases from artists in your library. Immerse follows
+          everyone in your library by default and surfaces their new
+          albums + singles here so you don't miss anything.
+        </>
+      ),
+    },
+    {
+      target: '[data-tutorial-target="dock-stats"]',
+      title: 'Listening stats',
+      body: (
+        <>
+          Charts and lists showing what you've been listening to most —
+          top tracks, top albums, top artists, plus play counts and
+          totals over different time windows.
+        </>
+      ),
+    },
+    {
+      target: '[data-tutorial-target="dock-track"]',
+      title: 'About this track',
+      body: (
+        <>
+          Deep info on whatever's currently playing — full lyrics if
+          available, album context, similar tracks, and a play history
+          for just that song.
+        </>
+      ),
+    },
+    {
+      target: '[data-tutorial-target="dock-queue"]',
+      title: 'Queue',
+      body: (
+        <>
+          What's playing next. Drag to reorder, click any track to jump
+          to it, or right-click for queue management. The number badge
+          shows how many tracks are queued up.
+        </>
+      ),
+    },
+    {
+      target: '[data-tutorial-target="dock-settings"]',
+      title: 'Settings',
+      body: (
+        <>
+          Configure Spotify and Soulseek, manage your library, customize
+          the UI, see what's new in each update, and reopen this
+          tutorial. Almost every tweak lives here.
+        </>
+      ),
+    },
+    {
+      target: null, // final card
+      title: "You're set",
+      body: (
+        <>
+          That's the dock. Click around, play with it — nothing here is
+          destructive. If you ever want a refresher, Settings →
+          <strong style={{ color: 'rgba(255,255,255,0.9)' }}> Open tutorial</strong>{' '}
+          brings this walkthrough back.
+        </>
+      ),
+    },
+  ], []);
+
+  const step = steps[stepIdx];
+
+  // Measure the highlighted element each time the step changes and on
+  // window resize. Using a small rAF dance so we don't measure
+  // mid-transition.
+  useLayoutEffect(() => {
+    if (!step) return undefined;
+    let rafId = null;
+    let cleanup = null;
+    const measure = () => {
+      if (!step.target) {
+        setTargetRect(null);
+        return;
+      }
+      const el = document.querySelector(step.target);
+      if (!el) {
+        setTargetRect(null);
+        return;
+      }
+      const r = el.getBoundingClientRect();
+      setTargetRect({
+        top: r.top, left: r.left,
+        width: r.width, height: r.height,
+        bottom: r.bottom, right: r.right,
+      });
+    };
+    // First pass on next frame so the DOM is settled.
+    rafId = requestAnimationFrame(measure);
+    // Re-measure on resize. Resize event covers most cases; for the
+    // dock being toggled (collapsed/expanded), we'd want a MutationObserver,
+    // but for the tutorial use case the user shouldn't be opening/closing
+    // the dock mid-tutorial so we don't bother.
+    const onResize = () => measure();
+    window.addEventListener('resize', onResize);
+    cleanup = () => {
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      window.removeEventListener('resize', onResize);
+    };
+    return cleanup;
+  }, [step]);
+
+  // Escape dismisses; arrow keys step through.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        onClose?.();
+      } else if (e.key === 'ArrowRight' || e.key === 'Enter') {
+        if (stepIdx < steps.length - 1) setStepIdx(stepIdx + 1);
+        else onClose?.();
+      } else if (e.key === 'ArrowLeft') {
+        if (stepIdx > 0) setStepIdx(stepIdx - 1);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [stepIdx, steps.length, onClose]);
+
+  const isFirst = stepIdx === 0;
+  const isLast = stepIdx === steps.length - 1;
+
+  // Tooltip placement.
+  //
+  // The body text varies a lot in height step-to-step, so a fixed
+  // estimate clips off-screen on smaller windows (the app launches at
+  // a set width × height, not maximized, so "viewport" can be ~800×500).
+  //
+  // Solution: measure the tooltip card's actual size after it renders
+  // (via a ref + ResizeObserver), then recompute position using that
+  // real height. Until measurement completes (one frame), render the
+  // card at the estimated position with visibility:hidden so it
+  // doesn't flash in the wrong place.
+  const cardRef = useRef(null);
+  const [cardSize, setCardSize] = useState(null);
+
+  // Reset measurement when step changes — the new step's content
+  // will have a different height.
+  useLayoutEffect(() => {
+    setCardSize(null);
+  }, [stepIdx]);
+
+  useLayoutEffect(() => {
+    if (!cardRef.current) return undefined;
+    const el = cardRef.current;
+    const measure = () => {
+      const r = el.getBoundingClientRect();
+      // Avoid pointless re-renders if size hasn't changed (RO fires
+      // extra times during opacity transitions).
+      setCardSize((prev) => {
+        if (prev && Math.abs(prev.width - r.width) < 1 && Math.abs(prev.height - r.height) < 1) {
+          return prev;
+        }
+        return { width: r.width, height: r.height };
+      });
+    };
+    measure();
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(measure);
+      ro.observe(el);
+      return () => ro.disconnect();
+    }
+    return undefined;
+  }, [stepIdx]);
+
+  const tooltipPos = useMemo(() => {
+    if (!targetRect) {
+      return { centered: true };
+    }
+    const TOOLTIP_W = cardSize?.width || 320;
+    const TOOLTIP_H = cardSize?.height || 200;
+    const GAP = 14;
+    const MARGIN = 12;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    // Available room on each side, after accounting for the safety
+    // margin at the far viewport edge.
+    const roomRight = vw - targetRect.right - GAP - MARGIN;
+    const roomLeft = targetRect.left - GAP - MARGIN;
+    const roomBelow = vh - targetRect.bottom - GAP - MARGIN;
+    const roomAbove = targetRect.top - GAP - MARGIN;
+
+    // Score each side: positive = tooltip fits; negative = overflow.
+    // Also require the PERPENDICULAR axis to have room (a tooltip on
+    // the right side still needs vertical room to roughly center, and
+    // vice-versa).
+    const candidates = [
+      { side: 'right', score: roomRight - TOOLTIP_W, perpFits: vh >= TOOLTIP_H + MARGIN * 2 },
+      { side: 'left',  score: roomLeft  - TOOLTIP_W, perpFits: vh >= TOOLTIP_H + MARGIN * 2 },
+      { side: 'below', score: roomBelow - TOOLTIP_H, perpFits: vw >= TOOLTIP_W + MARGIN * 2 },
+      { side: 'above', score: roomAbove - TOOLTIP_H, perpFits: vw >= TOOLTIP_W + MARGIN * 2 },
+    ];
+    // Prefer sides where both axes fit. Within that, biggest positive
+    // score wins (most breathing room).
+    candidates.sort((a, b) => {
+      const aFits = a.perpFits && a.score >= 0 ? 1 : 0;
+      const bFits = b.perpFits && b.score >= 0 ? 1 : 0;
+      if (aFits !== bFits) return bFits - aFits;
+      return b.score - a.score;
+    });
+    const side = candidates[0].side;
+
+    let top, left;
+    if (side === 'right') {
+      left = targetRect.right + GAP;
+      top = targetRect.top + targetRect.height / 2 - TOOLTIP_H / 2;
+    } else if (side === 'left') {
+      left = targetRect.left - TOOLTIP_W - GAP;
+      top = targetRect.top + targetRect.height / 2 - TOOLTIP_H / 2;
+    } else if (side === 'below') {
+      left = targetRect.left + targetRect.width / 2 - TOOLTIP_W / 2;
+      top = targetRect.bottom + GAP;
+    } else {
+      left = targetRect.left + targetRect.width / 2 - TOOLTIP_W / 2;
+      top = targetRect.top - TOOLTIP_H - GAP;
+    }
+
+    // Final clamp using the REAL tooltip dimensions. If the tooltip is
+    // somehow larger than the viewport (extremely narrow window + long
+    // body text), the clamp would push it negative; in that case we
+    // give up on placement and fall back to centered so at least the
+    // user can read it.
+    if (TOOLTIP_W > vw - MARGIN * 2 || TOOLTIP_H > vh - MARGIN * 2) {
+      return { centered: true };
+    }
+    top = Math.max(MARGIN, Math.min(vh - TOOLTIP_H - MARGIN, top));
+    left = Math.max(MARGIN, Math.min(vw - TOOLTIP_W - MARGIN, left));
+    return { top, left, side, width: TOOLTIP_W };
+  }, [targetRect, cardSize]);
+
+  // Spotlight padding — how much room around the target the spotlight
+  // hole extends. Makes small icons easier to identify and adds visual
+  // breathing room.
+  const SPOTLIGHT_PAD = 6;
+  const spotlightRect = targetRect ? {
+    top: targetRect.top - SPOTLIGHT_PAD,
+    left: targetRect.left - SPOTLIGHT_PAD,
+    width: targetRect.width + SPOTLIGHT_PAD * 2,
+    height: targetRect.height + SPOTLIGHT_PAD * 2,
+  } : null;
+
+  return (
+    <div
+      ref={overlayRef}
+      // Full-viewport overlay. zIndex above ToastStack (60) and the
+      // What's New overlay (100) so the tutorial sits on top of
+      // everything.
+      style={{
+        position: 'fixed', inset: 0, zIndex: 200,
+        // pointer-events flow: the overlay catches clicks except where
+        // the spotlight cutout is (we want the dock to be visible but
+        // not interactive during the tour — so we keep pointer-events
+        // on for the overlay and the tooltip card).
+        pointerEvents: 'auto',
+      }}
+      onMouseDown={(e) => {
+        // Click on backdrop (anywhere not on the card) advances by one
+        // step, which feels more like a guided tour than "click to
+        // dismiss" — dismissing is reserved for Skip / Escape.
+        if (e.target === overlayRef.current) {
+          if (stepIdx < steps.length - 1) setStepIdx(stepIdx + 1);
+          else onClose?.();
+        }
+      }}
+    >
+      {/* SVG mask — the dark backdrop with a transparent rectangle cut
+          out where the spotlight should be. Using SVG with mask-image
+          would be simpler but Electron sometimes gets weird about that;
+          SVG with fill-rule="evenodd" is bulletproof and renders
+          identically across platforms. */}
+      <svg
+        width="100%" height="100%"
+        viewBox={`0 0 ${typeof window !== 'undefined' ? window.innerWidth : 1280} ${typeof window !== 'undefined' ? window.innerHeight : 800}`}
+        preserveAspectRatio="none"
+        style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}
+      >
+        <defs>
+          {/* Soft inner glow around the spotlight. Pure cosmetic. */}
+          <filter id="tutorialSpotlightGlow" x="-50%" y="-50%" width="200%" height="200%">
+            <feGaussianBlur stdDeviation="6" />
+          </filter>
+        </defs>
+        {spotlightRect ? (
+          <>
+            <path
+              fillRule="evenodd"
+              fill="rgba(0,0,0,0.72)"
+              d={`M 0 0 H ${window.innerWidth} V ${window.innerHeight} H 0 Z M ${spotlightRect.left} ${spotlightRect.top} h ${spotlightRect.width} v ${spotlightRect.height} h -${spotlightRect.width} Z`}
+            />
+            {/* Accent ring around the spotlight */}
+            <rect
+              x={spotlightRect.left} y={spotlightRect.top}
+              width={spotlightRect.width} height={spotlightRect.height}
+              fill="none"
+              stroke="rgba(29,185,84,0.55)"
+              strokeWidth="2"
+              rx="10" ry="10"
+            />
+          </>
+        ) : (
+          <rect width="100%" height="100%" fill="rgba(0,0,0,0.72)" />
+        )}
+      </svg>
+
+      {/* Tooltip card */}
+      <div
+        ref={cardRef}
+        style={{
+          position: 'absolute',
+          // Hide the card during the very first paint of each step,
+          // before we've measured its real size. Without this, the card
+          // briefly flashes at the estimated position (using fallback
+          // 320×200) then jumps to its measured position once the
+          // ResizeObserver fires. Setting visibility:hidden keeps it
+          // measurable but invisible until cardSize is populated.
+          visibility: (!tooltipPos.centered && !cardSize) ? 'hidden' : 'visible',
+          ...(tooltipPos.centered ? {
+            top: '50%', left: '50%',
+            transform: 'translate(-50%, -50%)',
+            width: 360,
+          } : {
+            top: tooltipPos.top,
+            left: tooltipPos.left,
+            width: tooltipPos.width,
+          }),
+          borderRadius: 14,
+          background: 'rgba(22, 22, 24, 0.94)',
+          backdropFilter: 'blur(28px) saturate(1.5)',
+          WebkitBackdropFilter: 'blur(28px) saturate(1.5)',
+          border: '1px solid rgba(255,255,255,0.1)',
+          boxShadow: '0 16px 44px rgba(0,0,0,0.6), 0 0 0 1px rgba(29,185,84,0.15)',
+          color: 'rgba(255,255,255,0.85)',
+          fontSize: 12.5,
+          lineHeight: 1.55,
+          overflow: 'hidden',
+        }}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div style={{
+          padding: '14px 18px 6px',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        }}>
+          <div style={{
+            fontSize: 9.5, letterSpacing: 0.7, textTransform: 'uppercase',
+            color: '#1db954', fontWeight: 700,
+          }}>
+            Tutorial · {stepIdx + 1} of {steps.length}
+          </div>
+          <button
+            type="button"
+            onClick={() => onClose?.()}
+            aria-label="Skip tutorial"
+            style={{
+              width: 22, height: 22,
+              borderRadius: 6,
+              border: 'none',
+              background: 'transparent',
+              color: 'rgba(255,255,255,0.45)',
+              cursor: 'pointer',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = '#fff'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = 'rgba(255,255,255,0.45)'; }}
+          >
+            ×
+          </button>
+        </div>
+
+        {/* Title + body */}
+        <div style={{ padding: '0 18px 12px' }}>
+          <div style={{
+            fontSize: 16, fontWeight: 700, color: '#fff',
+            marginTop: 4, marginBottom: 6,
+          }}>
+            {step.title}
+          </div>
+          <div>{step.body}</div>
+        </div>
+
+        {/* Progress dots */}
+        <div style={{
+          display: 'flex', justifyContent: 'center', gap: 5,
+          padding: '2px 18px 10px',
+        }}>
+          {steps.map((_, i) => (
+            <span
+              key={i}
+              style={{
+                width: 5, height: 5, borderRadius: '50%',
+                background: i === stepIdx ? '#1db954' : 'rgba(255,255,255,0.18)',
+                transition: 'background 0.12s',
+              }}
+            />
+          ))}
+        </div>
+
+        {/* Footer buttons */}
+        <div style={{
+          padding: '10px 16px 14px',
+          display: 'flex', gap: 8, alignItems: 'center',
+          borderTop: '1px solid rgba(255,255,255,0.05)',
+        }}>
+          <button
+            type="button"
+            onClick={() => onClose?.()}
+            style={{
+              padding: '6px 12px', borderRadius: 8,
+              border: '1px solid rgba(255,255,255,0.08)',
+              background: 'transparent',
+              color: 'rgba(255,255,255,0.55)',
+              fontSize: 11, fontWeight: 600,
+              cursor: 'pointer',
+            }}
+          >
+            Skip
+          </button>
+          <div style={{ flex: 1 }} />
+          <button
+            type="button"
+            onClick={() => setStepIdx(stepIdx - 1)}
+            disabled={isFirst}
+            style={{
+              padding: '6px 12px', borderRadius: 8,
+              border: '1px solid rgba(255,255,255,0.1)',
+              background: 'rgba(255,255,255,0.04)',
+              color: isFirst ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.8)',
+              fontSize: 11, fontWeight: 600,
+              cursor: isFirst ? 'default' : 'pointer',
+              opacity: isFirst ? 0.5 : 1,
+            }}
+          >
+            Back
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (isLast) onClose?.();
+              else setStepIdx(stepIdx + 1);
+            }}
+            style={{
+              padding: '6px 16px', borderRadius: 8,
+              border: '1px solid rgba(29,185,84,0.4)',
+              background: 'rgba(29,185,84,0.22)',
+              color: '#1db954',
+              fontSize: 11, fontWeight: 700,
+              cursor: 'pointer',
+            }}
+          >
+            {isLast ? 'Done' : 'Next'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const kbdStyle = {
+  display: 'inline-block',
+  padding: '1px 6px',
+  borderRadius: 4,
+  background: 'rgba(255,255,255,0.08)',
+  border: '1px solid rgba(255,255,255,0.12)',
+  color: 'rgba(255,255,255,0.85)',
+  fontSize: 10,
+  fontFamily: 'ui-monospace, SF Mono, Menlo, Consolas, monospace',
+};
 
 /**
  * WinBtn — custom Immerse-styled window control button.

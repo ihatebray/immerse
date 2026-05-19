@@ -31,6 +31,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('library:rescanProgress', listener);
     return () => ipcRenderer.removeListener('library:rescanProgress', listener);
   },
+  rescanExplicit: () => ipcRenderer.invoke('library:rescanExplicit'),
+  onRescanExplicitProgress: (cb) => {
+    const listener = (_event, payload) => cb(payload);
+    ipcRenderer.on('library:rescanExplicitProgress', listener);
+    return () => ipcRenderer.removeListener('library:rescanExplicitProgress', listener);
+  },
   loadPlaylists: () => ipcRenderer.invoke('playlists:load'),
   loadPlaylistTrackIds: (playlistId) => ipcRenderer.invoke('playlists:loadTrackIds', playlistId),
   createPlaylist: (fields) => ipcRenderer.invoke('playlists:create', fields),
@@ -65,6 +71,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   whatsnewGetLastSeen: () => ipcRenderer.invoke('whatsnew:getLastSeen'),
   whatsnewSetLastSeen: (version) => ipcRenderer.invoke('whatsnew:setLastSeen', version),
   whatsnewFetchReleaseNotes: (version) => ipcRenderer.invoke('whatsnew:fetchReleaseNotes', version),
+  // First-run tutorial flag
+  tutorialGetSeen: () => ipcRenderer.invoke('tutorial:getSeen'),
+  tutorialSetSeen: (seen) => ipcRenderer.invoke('tutorial:setSeen', seen),
   onSpotifyUserAuthChanged: (cb) => {
     const listener = (_event, payload) => cb(payload);
     ipcRenderer.on('spotify:userAuthChanged', listener);

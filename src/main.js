@@ -581,6 +581,41 @@ ipcMain.handle('whatsnew:fetchReleaseNotes', async (_e, version) => {
   }
 });
 
+/**
+ * Tutorial-seen storage. Single-line JSON file like the what's-new one
+ * but tracks whether the user has dismissed the first-run tutorial.
+ * Renderer reads on mount and shows the tutorial automatically the
+ * first time; Settings has an "Open tutorial" button that triggers it
+ * regardless of this flag.
+ */
+function tutorialSeenPath() {
+  return path.join(app.getPath('userData'), 'tutorial-seen.json');
+}
+
+ipcMain.handle('tutorial:getSeen', () => {
+  try {
+    const raw = fs.readFileSync(tutorialSeenPath(), 'utf8');
+    const j = JSON.parse(raw);
+    return { ok: true, seen: !!j?.seen };
+  } catch {
+    return { ok: true, seen: false };
+  }
+});
+
+ipcMain.handle('tutorial:setSeen', (_e, seen) => {
+  try {
+    fs.mkdirSync(path.dirname(tutorialSeenPath()), { recursive: true });
+    fs.writeFileSync(
+      tutorialSeenPath(),
+      JSON.stringify({ seen: !!seen }),
+      'utf8',
+    );
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
 function newTrackId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
@@ -1180,6 +1215,95 @@ ipcMain.handle('library:rescanMetadata', async (event) => {
     return { ok: true, total, updated, failed };
   } catch (e) {
     console.error('[library:rescanMetadata] threw:', e);
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
+/**
+ * Rescan explicit flags from Spotify.
+ *
+ * Backfills the explicit field for library tracks that don't currently
+ * have it set. Useful for tracks that were imported via the manual
+ * soulseek search before the explicit-flag fix landed — those rows have
+ * `explicit: null` because the file's own tags rarely include the flag.
+ *
+ * For each candidate track:
+ *   1. Skip if explicit is already a boolean (true OR false). We trust
+ *      whatever was previously written; rescanning would just re-do
+ *      the same Spotify check.
+ *   2. Run spotifyCrossCheck({ title, artist, album }) — same matching
+ *      logic as the soulseek ingest path.
+ *   3. If Spotify returns a confident candidate AND its explicit field
+ *      is a boolean, write it to the library.
+ *
+ * No-op for tracks with no Spotify credentials configured — the
+ * cross-check returns null without making a request. We surface a
+ * specific error in that case so the user knows why nothing happened.
+ *
+ * Rate-limited internally: 200ms delay between Spotify search calls so
+ * we don't hammer the API on a large library. Spotify's rate limit is
+ * generous but bursts of 100+ requests in one second risk a 429.
+ *
+ * Progress events stream on 'library:rescanExplicitProgress' with the
+ * same shape as the metadata rescan.
+ */
+ipcMain.handle('library:rescanExplicit', async (event) => {
+  try {
+    if (!spotifyCredentialsConfigured()) {
+      return {
+        ok: false,
+        error: 'Spotify credentials not configured. Add Client ID + Secret in Settings → Spotify API first.',
+      };
+    }
+    const all = await loadAllTracks();
+    const sender = event.sender;
+    // Filter to tracks that actually need a check. Skip ones that
+    // already have a boolean — they came in via a path that set it
+    // correctly and re-checking would do nothing.
+    const candidates = all.filter((t) => typeof t.explicit !== 'boolean');
+    const total = candidates.length;
+    let scanned = 0;
+    let updated = 0;
+    let failed = 0;
+
+    for (const t of candidates) {
+      scanned += 1;
+      try { sender.send('library:rescanExplicitProgress', { scanned, total, updated, failed }); }
+      catch { /* renderer gone */ }
+
+      const title = (t.title || '').trim();
+      const artist = (t.artist || '').trim();
+      const album = (t.album || '').trim();
+      // Need at least a title to search. Anything less and the
+      // cross-check would return junk.
+      if (!title) { failed += 1; continue; }
+
+      let cand;
+      try {
+        cand = await spotifyCrossCheck({ title, artist, album });
+      } catch {
+        failed += 1;
+        continue;
+      }
+      if (!cand || typeof cand.explicit !== 'boolean') {
+        failed += 1;
+        continue;
+      }
+
+      const r = await updateTrackMetadata(t.id, { explicit: cand.explicit });
+      if (r?.ok) updated += 1;
+      else failed += 1;
+
+      // Gentle pace — keeps us under Spotify's rate ceiling on
+      // large libraries.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+
+    try { sender.send('library:rescanExplicitProgress', { scanned, total, updated, failed, done: true }); }
+    catch { /* ignore */ }
+    return { ok: true, total, updated, failed };
+  } catch (e) {
+    console.error('[library:rescanExplicit] threw:', e);
     return { ok: false, error: String(e?.message || e) };
   }
 });
@@ -2209,6 +2333,12 @@ async function ingestSoulseekFile({ downloadedPath, originalFilename }) {
   let year = parsed.year ?? null;
   let coverArt = parsed.coverArt || null;
   let coverArtUrl = parsed.coverArtUrl || null;
+  // Explicit flag. Read from the file's own tags first, but almost no
+  // Soulseek-sourced MP3/FLAC has a usable explicit tag (ID3 doesn't
+  // have a standard frame for it; iTunes uses a non-standard atom that
+  // gets stripped along the way). The Spotify cross-check below
+  // overrides this with the canonical answer whenever it matches.
+  let explicit = typeof parsed.explicit === 'boolean' ? parsed.explicit : null;
 
   // Spotify cross-check. If we have a confident match, replace metadata
   // with their canonical values. Cover art prefers Spotify's (consistent
@@ -2223,6 +2353,12 @@ async function ingestSoulseekFile({ downloadedPath, originalFilename }) {
       if (cand.trackNumber != null) trackNumber = cand.trackNumber;
       if (cand.discNumber != null) discNumber = cand.discNumber;
       if (cand.year != null) year = cand.year;
+      // Spotify's explicit flag is authoritative — every other path
+      // (manual playlist import, etc.) already trusts it; the manual
+      // soulseek download used to fall through to parsed.explicit
+      // which was almost always null, dropping the "E" badge from the
+      // library row. Take Spotify's value whenever it's a boolean.
+      if (typeof cand.explicit === 'boolean') explicit = cand.explicit;
       const spotifyArt = cand.albumArtUrl || cand.imageUrl;
       if (spotifyArt) {
         const dataUrl = await fetchSpotifyCoverAsDataUrl(spotifyArt);
@@ -2246,7 +2382,7 @@ async function ingestSoulseekFile({ downloadedPath, originalFilename }) {
     discNumber,
     year,
     genre: parsed.genre || '',
-    explicit: typeof parsed.explicit === 'boolean' ? parsed.explicit : null,
+    explicit,
   };
 
   const res = await upsertTracks([track]);
