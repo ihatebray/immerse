@@ -2254,6 +2254,19 @@ function normalizeTitle(s) {
  * title in either direction, AND the artist must overlap (one of our
  * artist tokens appears in their artist tokens, or vice versa).
  *
+ * Among matching candidates, prefer one with `explicit: true`. This
+ * matters because Spotify often returns BOTH versions of a song (the
+ * original explicit and a clean radio edit) and the renderer's logic
+ * used to stop at the first hit — which was often the radio edit,
+ * causing songs the user definitely has the explicit version of to
+ * end up flagged clean. Bias toward explicit, since:
+ *   1. Most pirated/downloaded files are the explicit version (radio
+ *      edits are rarer in the wild).
+ *   2. The "explicit" flag in the library is intended as a *capability
+ *      indicator* ("this song exists with explicit content") rather
+ *      than a per-file confirmation. Marking E for a song that has an
+ *      explicit version is correct in the common case.
+ *
  * If Spotify isn't configured or the search errors, returns null silently.
  */
 async function spotifyCrossCheck({ title, artist, album }) {
@@ -2277,6 +2290,10 @@ async function spotifyCrossCheck({ title, artist, album }) {
   const myArtist = normalizeTitle(artistQ);
   const myArtistTokens = new Set(myArtist.split(' ').filter(Boolean));
 
+  // Collect EVERY matching candidate (within the top 5), not just the
+  // first. Then pick: explicit-version preferred, otherwise the first
+  // match.
+  const matches = [];
   for (const cand of candidates.slice(0, 5)) {
     const candTitle = normalizeTitle(cand.title || cand.name || '');
     const candArtist = normalizeTitle(cand.artists || cand.artist || '');
@@ -2303,9 +2320,18 @@ async function spotifyCrossCheck({ title, artist, album }) {
     }
     if (!artistMatches) continue;
 
-    return cand;
+    matches.push(cand);
   }
-  return null;
+
+  if (matches.length === 0) return null;
+
+  // Prefer the explicit version when multiple candidates pass.
+  const explicitMatch = matches.find((c) => c.explicit === true);
+  if (explicitMatch) return explicitMatch;
+
+  // Otherwise fall back to the first match (preserves prior behavior
+  // for songs where no explicit version exists).
+  return matches[0];
 }
 
 /**
