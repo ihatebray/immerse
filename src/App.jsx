@@ -182,7 +182,11 @@ export default function App() {
           durationMs: 0, // 0 = no auto-dismiss; user has to click
           action: {
             label: 'Restart',
-            handler: () => {
+            // The toast bus expects `onClick`, not `handler`. Older
+            // code in this file accidentally used `handler` which
+            // meant the button silently did nothing because Toasts.jsx
+            // guards on `!toast.action?.onClick`.
+            onClick: () => {
               try { api.updateInstall?.(); }
               catch { /* main quits us regardless */ }
             },

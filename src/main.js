@@ -1,4 +1,30 @@
 import { app, BrowserWindow, ipcMain, dialog, protocol, net, shell } from 'electron';
+
+// Squirrel.Windows install/update/uninstall hooks. When Squirrel runs
+// any of these lifecycle events (install, first-run, update, uninstall),
+// it spawns the app with a special arg like --squirrel-firstrun or
+// --squirrel-updated. If we don't quit immediately on these events,
+// the spawned instance hangs around and a SECOND copy of the app gets
+// launched after the update — which is the "new instance opens by
+// itself after the download finishes" bug.
+//
+// `electron-squirrel-startup` handles all four lifecycle events
+// (--squirrel-install, --squirrel-updated, --squirrel-uninstall,
+// --squirrel-obsolete) by creating/removing shortcuts and quitting
+// the spawned process. This MUST be the first thing in main.js, before
+// any IPC handlers or window code — if we don't return early, we'll
+// double-launch on every install/update.
+//
+// In dev (`npm start`) it always returns false so this is a no-op.
+// eslint-disable-next-line global-require
+if (require('electron-squirrel-startup')) {
+  app.quit();
+  // Returning here at the top level only works under CJS bundling.
+  // For ESM-style imports we explicitly skip the rest by checking
+  // app.isQuitting later in createWindow if needed, but app.quit()
+  // fires before anything else gets a chance to run.
+}
+
 import path from 'path';
 import fs from 'fs';
 import {
