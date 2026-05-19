@@ -17780,16 +17780,7 @@ function SettingsTab({
 
       {/* Spotify API */}
       <Section title="SPOTIFY API">
-        <div style={{ fontSize: 10.5, color: 'rgba(255,255,255,0.45)', lineHeight: 1.5, marginBottom: 10 }}>
-          Free app from
-          {' '}
-          <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noreferrer" style={{ color: '#1db954' }}>developer.spotify.com/dashboard</a>
-          . Client ID + Secret powers search. To import your playlists you also need to connect your Spotify account (one-time browser sign-in). Add
-          {' '}
-          <code style={{ color: 'rgba(255,255,255,0.7)' }}>http://127.0.0.1:8888/callback</code>
-          {' '}
-          to the app's Redirect URIs in the dashboard before connecting.
-        </div>
+        <SpotifySetupGuide />
         {!api ? (
           <Banner color="#f37272" bg="rgba(243,114,114,0.1)">
             No Electron preload available.
@@ -19217,6 +19208,189 @@ function CandidatePickerModal({ open, candidates: initialCandidates, meta, onPic
  * After success, shows a summary ("Removed N tracks · Deleted N files ·
  * Skipped N user-imported") and auto-closes after a beat.
  */
+
+/**
+ * SpotifySetupGuide — collapsible step-by-step walkthrough for getting
+ * a Client ID + Secret + connecting an account. Collapsed by default
+ * with a compact "Setup guide" disclosure; expanded shows the full
+ * three-step flow with anchor links into the right dashboard pages.
+ *
+ * The expanded state isn't persisted — every time the user opens
+ * Settings, the guide starts collapsed. That's deliberate: once they've
+ * done it once they don't need to see the guide again on subsequent
+ * Settings visits, but it's still discoverable for the next time they
+ * forget which redirect URI to add.
+ */
+function SpotifySetupGuide() {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{
+      marginBottom: 10,
+      borderRadius: 9,
+      border: '1px solid rgba(255,255,255,0.07)',
+      background: 'rgba(0,0,0,0.18)',
+      overflow: 'hidden',
+    }}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          width: '100%',
+          padding: '9px 11px',
+          display: 'flex', alignItems: 'center', gap: 8,
+          background: 'transparent',
+          border: 'none',
+          cursor: 'pointer',
+          textAlign: 'left',
+          color: 'rgba(255,255,255,0.85)',
+          fontSize: 11.5, fontWeight: 600,
+        }}
+      >
+        <span
+          aria-hidden
+          style={{
+            display: 'inline-block',
+            width: 8,
+            transform: open ? 'rotate(90deg)' : 'rotate(0deg)',
+            transition: 'transform 120ms ease',
+            color: '#1db954',
+            fontSize: 9,
+          }}
+        >
+          ▶
+        </span>
+        <span>Setup guide</span>
+        <span style={{ marginLeft: 'auto', fontSize: 10, color: 'rgba(255,255,255,0.4)', fontWeight: 500 }}>
+          {open ? 'hide' : 'first time?'}
+        </span>
+      </button>
+      {open ? (
+        <div style={{
+          padding: '4px 12px 12px',
+          fontSize: 11, lineHeight: 1.6, color: 'rgba(255,255,255,0.7)',
+        }}>
+          <SetupStep
+            num={1}
+            title="Create a Spotify developer app"
+          >
+            Go to{' '}
+            <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noreferrer" style={setupLinkStyle}>
+              developer.spotify.com/dashboard
+            </a>
+            . Sign in with your regular Spotify account (Free works fine).
+            Click <strong style={setupEmStyle}>Create app</strong>.
+            <ul style={setupListStyle}>
+              <li><strong style={setupEmStyle}>App name</strong>: anything (e.g. "Immerse")</li>
+              <li><strong style={setupEmStyle}>App description</strong>: anything (e.g. "Personal music player")</li>
+              <li><strong style={setupEmStyle}>Redirect URIs</strong>: add exactly{' '}
+                <code style={setupCodeStyle}>http://127.0.0.1:8888/callback</code>
+                {' '}— click Add after typing it.
+                {' '}<span style={setupNoteStyle}>It MUST be 127.0.0.1, not "localhost".</span>
+              </li>
+              <li><strong style={setupEmStyle}>Which APIs</strong>: just check "Web API"</li>
+            </ul>
+            Agree to the terms and click <strong style={setupEmStyle}>Save</strong>.
+          </SetupStep>
+
+          <SetupStep
+            num={2}
+            title="Copy your Client ID and Client Secret"
+          >
+            On your new app's page, click <strong style={setupEmStyle}>Settings</strong> in
+            the top-right. You'll see your Client ID immediately. Click
+            {' '}<strong style={setupEmStyle}>View client secret</strong> to reveal the secret.
+            Copy both, then paste them into the fields below.
+            <div style={{ marginTop: 6, fontSize: 10.5, color: 'rgba(255,255,255,0.5)' }}>
+              Treat the Client Secret like a password — don't share it. It's
+              stored locally in your Immerse settings folder and never
+              transmitted except to Spotify.
+            </div>
+          </SetupStep>
+
+          <SetupStep
+            num={3}
+            title="Connect your Spotify account"
+            last
+          >
+            After saving the ID + Secret below, click{' '}
+            <strong style={setupEmStyle}>Connect Spotify account</strong>. A browser
+            tab opens — log in (if needed) and click <strong style={setupEmStyle}>Agree</strong>.
+            The tab will say "Spotify connected" and you can close it.
+            <div style={{ marginTop: 6, fontSize: 10.5, color: 'rgba(255,255,255,0.5)' }}>
+              This is only needed for importing playlists. Single-track and
+              album search work with just the ID + Secret.
+            </div>
+          </SetupStep>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+const setupLinkStyle = {
+  color: '#1db954',
+  textDecoration: 'none',
+  borderBottom: '1px solid rgba(29,185,84,0.4)',
+};
+const setupEmStyle = { color: 'rgba(255,255,255,0.92)', fontWeight: 600 };
+const setupCodeStyle = {
+  display: 'inline-block',
+  padding: '1px 5px',
+  borderRadius: 4,
+  background: 'rgba(0,0,0,0.4)',
+  border: '1px solid rgba(255,255,255,0.08)',
+  color: '#1db954',
+  fontSize: 10.5,
+  fontFamily: 'ui-monospace, SF Mono, Menlo, Consolas, monospace',
+};
+const setupListStyle = {
+  margin: '6px 0 6px 0',
+  paddingLeft: 18,
+  listStyleType: 'disc',
+};
+const setupNoteStyle = {
+  fontSize: 10,
+  color: 'rgba(243,170,114,0.85)',
+  fontStyle: 'italic',
+};
+
+/**
+ * SetupStep — single numbered step within the SpotifySetupGuide.
+ * Renders a green numbered circle on the left and the step content on
+ * the right, with a vertical connector line down to the next step.
+ * `last` suppresses the connector so the final step doesn't have a
+ * dangling line.
+ */
+function SetupStep({ num, title, children, last = false }) {
+  return (
+    <div style={{ display: 'flex', gap: 10, paddingTop: 8 }}>
+      <div style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+        <div style={{
+          width: 20, height: 20, borderRadius: '50%',
+          background: 'rgba(29,185,84,0.18)',
+          border: '1px solid rgba(29,185,84,0.5)',
+          color: '#1db954',
+          fontSize: 11, fontWeight: 700,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>
+          {num}
+        </div>
+        {!last ? (
+          <div style={{
+            width: 1, flex: 1, marginTop: 4,
+            background: 'rgba(29,185,84,0.18)',
+          }} />
+        ) : null}
+      </div>
+      <div style={{ flex: 1, paddingBottom: last ? 0 : 4 }}>
+        <div style={{ fontWeight: 600, color: 'rgba(255,255,255,0.9)', fontSize: 11.5, marginBottom: 2 }}>
+          {title}
+        </div>
+        <div>{children}</div>
+      </div>
+    </div>
+  );
+}
 
 /**
  * UpdatesSection — Settings panel for the auto-updater. Shows the

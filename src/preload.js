@@ -61,6 +61,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('update:status', listener);
   },
   appGetVersion: () => ipcRenderer.invoke('app:getVersion'),
+  // "What's new" overlay support
+  whatsnewGetLastSeen: () => ipcRenderer.invoke('whatsnew:getLastSeen'),
+  whatsnewSetLastSeen: (version) => ipcRenderer.invoke('whatsnew:setLastSeen', version),
+  whatsnewFetchReleaseNotes: (version) => ipcRenderer.invoke('whatsnew:fetchReleaseNotes', version),
   onSpotifyUserAuthChanged: (cb) => {
     const listener = (_event, payload) => cb(payload);
     ipcRenderer.on('spotify:userAuthChanged', listener);
