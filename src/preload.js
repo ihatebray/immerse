@@ -31,12 +31,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('library:rescanProgress', listener);
     return () => ipcRenderer.removeListener('library:rescanProgress', listener);
   },
-  rescanExplicit: () => ipcRenderer.invoke('library:rescanExplicit'),
-  onRescanExplicitProgress: (cb) => {
-    const listener = (_event, payload) => cb(payload);
-    ipcRenderer.on('library:rescanExplicitProgress', listener);
-    return () => ipcRenderer.removeListener('library:rescanExplicitProgress', listener);
-  },
   loadPlaylists: () => ipcRenderer.invoke('playlists:load'),
   loadPlaylistTrackIds: (playlistId) => ipcRenderer.invoke('playlists:loadTrackIds', playlistId),
   createPlaylist: (fields) => ipcRenderer.invoke('playlists:create', fields),

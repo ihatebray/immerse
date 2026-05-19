@@ -2244,6 +2244,10 @@ function MetadataEditor({ track, onSave, onClose, accent }) {
   const [genre, setGenre] = useState(track.genre || '');
   const [trackNumber, setTrackNumber] = useState(track.trackNumber != null ? String(track.trackNumber) : '');
   const [discNumber, setDiscNumber] = useState(track.discNumber != null ? String(track.discNumber) : '');
+  // Explicit flag — boolean only. The DB stores 0/1/null but for the
+  // UI we treat null and 0 the same way (no E badge). Initialize from
+  // whatever the DB has, coerced to a clean boolean.
+  const [explicit, setExplicit] = useState(track.explicit === 1 || track.explicit === true);
   // Cover art — null = removed, string = current data URI or URL
   const [coverArt, setCoverArt] = useState(track.coverArt || null);
   const [coverDirty, setCoverDirty] = useState(false); // tracks whether user changed the cover
@@ -2258,6 +2262,7 @@ function MetadataEditor({ track, onSave, onClose, accent }) {
   const firstInputRef = useRef(null);
 
   // Dirty-state check — only submit changed fields
+  const initialExplicit = track.explicit === 1 || track.explicit === true;
   const hasChanges
     = title.trim() !== (track.title || '').trim()
     || artist.trim() !== (track.artist || '').trim()
@@ -2266,6 +2271,7 @@ function MetadataEditor({ track, onSave, onClose, accent }) {
     || genre.trim() !== (track.genre || '').trim()
     || trackNumber.trim() !== (track.trackNumber != null ? String(track.trackNumber) : '').trim()
     || discNumber.trim() !== (track.discNumber != null ? String(track.discNumber) : '').trim()
+    || explicit !== initialExplicit
     || coverDirty;
 
   useEffect(() => {
@@ -2287,8 +2293,8 @@ function MetadataEditor({ track, onSave, onClose, accent }) {
       reject(new Error('File must be an image.'));
       return;
     }
-    if (file.size > 2_000_000) {
-      reject(new Error('Image too large (max 2MB source file).'));
+    if (file.size > 25_000_000) {
+      reject(new Error('Image too large (max 25MB source file).'));
       return;
     }
     const reader = new FileReader();
@@ -2302,8 +2308,8 @@ function MetadataEditor({ track, onSave, onClose, accent }) {
     setError('');
     try {
       const data = await readFileToDataUri(file);
-      if (data.length > 1_500_000) {
-        setError('Image too large after encoding. Try a smaller image (~1MB or less).');
+      if (data.length > 35_000_000) {
+        setError('Image too large after encoding. Try a smaller image (~25MB source or less).');
         return;
       }
       setCoverArt(data);
@@ -2399,6 +2405,7 @@ function MetadataEditor({ track, onSave, onClose, accent }) {
     if (dn !== (track.discNumber != null ? String(track.discNumber) : '').trim()) {
       fields.discNumber = dn ? Number(dn) : null;
     }
+    if (explicit !== initialExplicit) fields.explicit = explicit;
     if (coverDirty) fields.coverArt = coverArt;
 
     const r = await onSave(fields);
@@ -2657,6 +2664,47 @@ function MetadataEditor({ track, onSave, onClose, accent }) {
             </div>
           </div>
 
+          {/* Explicit toggle. Two-state — on or off. Off covers both
+              "clean" and "unset" since the UI doesn't distinguish them
+              (the E badge only shows when explicit === true). */}
+          <div
+            onClick={() => setExplicit((v) => !v)}
+            style={{
+              marginTop: 12,
+              display: 'flex', alignItems: 'center', gap: 11,
+              padding: '10px 12px', borderRadius: 9,
+              background: explicit ? `rgba(${accent},0.10)` : 'rgba(0,0,0,0.25)',
+              border: `1px solid ${explicit ? `rgba(${accent},0.45)` : 'rgba(255,255,255,0.08)'}`,
+              cursor: 'pointer',
+              transition: 'background 0.15s, border-color 0.15s',
+              userSelect: 'none',
+            }}
+          >
+            {/* Big E pill that visually mirrors the actual badge so the
+                user can see exactly what flipping this does. */}
+            <div style={{
+              width: 22, height: 22, borderRadius: 5,
+              background: explicit ? `rgb(${accent})` : 'rgba(255,255,255,0.08)',
+              color: explicit ? '#000' : 'rgba(255,255,255,0.4)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 12, fontWeight: 800, letterSpacing: 0,
+              flexShrink: 0,
+              transition: 'background 0.15s, color 0.15s',
+            }}>
+              E
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 12, color: '#fff', fontWeight: 500 }}>
+                Explicit
+              </div>
+              <div style={{ fontSize: 10.5, color: 'rgba(255,255,255,0.55)', marginTop: 1 }}>
+                {explicit
+                  ? 'Shows the E badge in your library.'
+                  : 'No E badge. Tap to mark this track as explicit.'}
+              </div>
+            </div>
+          </div>
+
           {error ? (
             <div style={{
               marginTop: 10, padding: '7px 10px', borderRadius: 8,
@@ -2755,6 +2803,12 @@ function AlbumMetadataEditor({ scope, onSave, onClose, accent }) {
   const [artist, setArtist] = useState(initArtist || '');
   const [year, setYear] = useState(initYear);
   const [genre, setGenre] = useState(initGenre);
+  // Explicit flag for bulk editor — TRI-state since some tracks in the
+  // selection might be explicit and others not. Values:
+  //   null       — leave each track's existing flag alone (default)
+  //   true       — mark every selected track as explicit
+  //   false      — mark every selected track as NOT explicit
+  const [explicitBulk, setExplicitBulk] = useState(null);
   const [coverArt, setCoverArt] = useState(initCover || null);
   const [coverDirty, setCoverDirty] = useState(false);
   const [coverMode, setCoverMode] = useState('preview'); // 'preview' | 'url'
@@ -2772,6 +2826,7 @@ function AlbumMetadataEditor({ scope, onSave, onClose, accent }) {
     || artist.trim() !== (initArtist || '').trim()
     || year.trim() !== initYear.trim()
     || genre.trim() !== initGenre.trim()
+    || explicitBulk !== null
     || coverDirty;
 
   useEffect(() => {
@@ -2792,8 +2847,8 @@ function AlbumMetadataEditor({ scope, onSave, onClose, accent }) {
       reject(new Error('File must be an image.'));
       return;
     }
-    if (file.size > 2_000_000) {
-      reject(new Error('Image too large (max 2MB source file).'));
+    if (file.size > 25_000_000) {
+      reject(new Error('Image too large (max 25MB source file).'));
       return;
     }
     const reader = new FileReader();
@@ -2807,8 +2862,8 @@ function AlbumMetadataEditor({ scope, onSave, onClose, accent }) {
     setError('');
     try {
       const data = await readFileToDataUri(file);
-      if (data.length > 1_500_000) {
-        setError('Image too large after encoding. Try a smaller image (~1MB or less).');
+      if (data.length > 35_000_000) {
+        setError('Image too large after encoding. Try a smaller image (~25MB source or less).');
         return;
       }
       setCoverArt(data);
@@ -2874,6 +2929,7 @@ function AlbumMetadataEditor({ scope, onSave, onClose, accent }) {
     if (artist.trim() !== (initArtist || '').trim()) fields.artist = artist.trim();
     if (y !== initYear.trim()) fields.year = y ? Number(y) : null;
     if (genre.trim() !== initGenre.trim()) fields.genre = genre.trim();
+    if (explicitBulk !== null) fields.explicit = explicitBulk;
     if (coverDirty) fields.coverArt = coverArt;
 
     const r = await onSave(fields);
@@ -3099,6 +3155,48 @@ function AlbumMetadataEditor({ scope, onSave, onClose, accent }) {
                 placeholder="Electronic, Pop, …" style={inputStyle}
                 onFocus={(e) => { e.currentTarget.style.borderColor = `rgba(${accent},0.5)`; }}
                 onBlur={(e) => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)'; }} />
+            </div>
+          </div>
+
+          {/* Explicit flag — tri-state in bulk because some tracks in
+              the selection might be explicit and others not. "Leave
+              unchanged" doesn't touch the field; "Explicit" / "Clean"
+              force the value across every selected track. */}
+          <div style={{ marginTop: 12 }}>
+            <div style={fieldLabelStyle}>Explicit</div>
+            <div style={{
+              display: 'flex', gap: 6,
+              background: 'rgba(0,0,0,0.25)',
+              padding: 4, borderRadius: 9,
+              border: '1px solid rgba(255,255,255,0.06)',
+            }}>
+              {[
+                { value: null, label: 'Leave unchanged' },
+                { value: true, label: 'Mark all explicit' },
+                { value: false, label: 'Mark all clean' },
+              ].map((opt) => {
+                const active = explicitBulk === opt.value;
+                return (
+                  <button
+                    key={String(opt.value)}
+                    type="button"
+                    onClick={() => setExplicitBulk(opt.value)}
+                    style={{
+                      flex: 1, padding: '6px 8px',
+                      borderRadius: 6, border: 'none',
+                      background: active ? `rgba(${accent},0.22)` : 'transparent',
+                      color: active ? '#fff' : 'rgba(255,255,255,0.55)',
+                      fontSize: 10.5, fontWeight: 600,
+                      cursor: 'pointer',
+                      transition: 'background 0.15s, color 0.15s',
+                    }}
+                    onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'rgba(255,255,255,0.04)'; }}
+                    onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
             </div>
           </div>
 
@@ -10312,8 +10410,8 @@ function PlaylistEditor({ mode, playlist, pendingAddCount = 0, onSave, onClose, 
       reject(new Error('File must be an image.'));
       return;
     }
-    if (file.size > 2_000_000) {
-      reject(new Error('Image too large (max 2MB source file).'));
+    if (file.size > 25_000_000) {
+      reject(new Error('Image too large (max 25MB source file).'));
       return;
     }
     const reader = new FileReader();
@@ -10327,8 +10425,8 @@ function PlaylistEditor({ mode, playlist, pendingAddCount = 0, onSave, onClose, 
     setError('');
     try {
       const data = await readFileToDataUri(file);
-      if (data.length > 1_500_000) {
-        setError('Image too large after encoding. Try a smaller image (~1MB or less).');
+      if (data.length > 35_000_000) {
+        setError('Image too large after encoding. Try a smaller image (~25MB source or less).');
         return;
       }
       setCoverArt(data);
@@ -18078,7 +18176,6 @@ function SettingsTab({
           externally. */}
       <Section title="LIBRARY MAINTENANCE">
         <RescanMetadataButton onReloadLibrary={onReloadLibrary} />
-        <RescanExplicitButton onReloadLibrary={onReloadLibrary} />
       </Section>
 
       {/* Danger zone — only exposed if the IPC is available (Electron) */}
@@ -19735,145 +19832,6 @@ function RescanMetadataButton({ onReloadLibrary }) {
               {result.failed > 0 ? <> · <span style={{ color: 'rgba(243,114,114,0.85)' }}>{result.failed} failed</span></> : null}
               .
             </>
-          ) : (
-            <>Re-scan failed: {result.error || 'unknown error'}</>
-          )}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-/**
- * RescanExplicitButton — backfills explicit flags from Spotify for any
- * library track whose explicit field isn't currently a boolean (typically
- * tracks imported via manual Soulseek search before the explicit-flag
- * fix landed in v1.0.5).
- *
- * Same shape as RescanMetadataButton: button → live progress → result
- * summary. The heavy lifting is done in main.js (library:rescanExplicit)
- * which loops candidates, runs spotifyCrossCheck, and writes updates.
- *
- * Requires Spotify credentials. If they aren't configured we still
- * render the button — main.js returns a friendly error explaining what
- * to set up.
- */
-function RescanExplicitButton({ onReloadLibrary }) {
-  const [busy, setBusy] = useState(false);
-  const [progress, setProgress] = useState(null);
-  const [result, setResult] = useState(null);
-
-  const api = typeof window !== 'undefined' ? window.electronAPI : null;
-  const available = !!(api && typeof api.rescanExplicit === 'function');
-
-  const handleClick = async () => {
-    if (!available || busy) return;
-    setBusy(true);
-    setResult(null);
-    setProgress({ scanned: 0, total: 0, updated: 0, failed: 0 });
-
-    let unsub = null;
-    if (typeof api.onRescanExplicitProgress === 'function') {
-      unsub = api.onRescanExplicitProgress((p) => {
-        if (p) setProgress(p);
-      });
-    }
-
-    let r;
-    try { r = await api.rescanExplicit(); }
-    catch (e) { r = { ok: false, error: String(e?.message || e) }; }
-
-    if (typeof unsub === 'function') unsub();
-
-    setBusy(false);
-    setResult(r);
-
-    if (r?.ok && typeof onReloadLibrary === 'function') {
-      try { await onReloadLibrary(); } catch { /* ignore */ }
-    }
-  };
-
-  if (!available) {
-    return (
-      <div style={{ fontSize: 10.5, color: 'rgba(255,255,255,0.4)', fontStyle: 'italic' }}>
-        Re-scan only works in the desktop app.
-      </div>
-    );
-  }
-
-  return (
-    <div style={{ marginTop: 14 }}>
-      <div style={{
-        fontSize: 10.5, color: 'rgba(255,255,255,0.55)',
-        lineHeight: 1.55, marginBottom: 10,
-      }}>
-        Re-check every track in your library against Spotify and backfill
-        the explicit flag for songs that were missing it. Useful for
-        songs imported via manual Soulseek search before the fix.
-      </div>
-      <button
-        type="button"
-        onClick={handleClick}
-        disabled={busy}
-        style={{
-          width: '100%', padding: '9px 12px', borderRadius: 9,
-          border: '1px solid rgba(255,255,255,0.10)',
-          background: busy ? 'rgba(255,255,255,0.04)' : 'rgba(255,255,255,0.06)',
-          color: 'rgba(255,255,255,0.85)',
-          fontSize: 11.5, fontWeight: 600,
-          cursor: busy ? 'default' : 'pointer',
-          transition: 'background 0.15s',
-        }}
-        onMouseEnter={(e) => { if (!busy) e.currentTarget.style.background = 'rgba(255,255,255,0.10)'; }}
-        onMouseLeave={(e) => { if (!busy) e.currentTarget.style.background = 'rgba(255,255,255,0.06)'; }}
-      >
-        {busy ? 'Re-scanning…' : 'Re-scan explicit flags'}
-      </button>
-
-      {busy && progress ? (
-        <div style={{ marginTop: 10 }}>
-          <div style={{
-            height: 4, borderRadius: 2,
-            background: 'rgba(255,255,255,0.06)', overflow: 'hidden',
-          }}>
-            <div style={{
-              height: '100%',
-              width: progress.total > 0
-                ? `${Math.min(100, (progress.scanned / progress.total) * 100)}%`
-                : '0%',
-              background: 'rgba(255,255,255,0.4)',
-              transition: 'width 0.2s',
-            }} />
-          </div>
-          <div style={{
-            marginTop: 6, fontSize: 10,
-            color: 'rgba(255,255,255,0.45)',
-            display: 'flex', justifyContent: 'space-between', gap: 8,
-            fontVariantNumeric: 'tabular-nums',
-          }}>
-            <span>{progress.scanned} / {progress.total}</span>
-            <span>{progress.updated} updated · {progress.failed} failed</span>
-          </div>
-        </div>
-      ) : null}
-
-      {!busy && result ? (
-        <div style={{
-          marginTop: 10, padding: '8px 10px', borderRadius: 7,
-          background: result.ok ? 'rgba(80,180,120,0.08)' : 'rgba(243,114,114,0.08)',
-          border: `1px solid ${result.ok ? 'rgba(80,180,120,0.2)' : 'rgba(243,114,114,0.25)'}`,
-          fontSize: 11, color: 'rgba(255,255,255,0.85)', lineHeight: 1.5,
-        }}>
-          {result.ok ? (
-            result.total === 0 ? (
-              <>Nothing to do — every track in your library already has an explicit flag set.</>
-            ) : (
-              <>
-                Updated <strong>{result.updated}</strong> of <strong>{result.total}</strong> candidate tracks
-                {result.failed > 0 ? <> · <span style={{ color: 'rgba(243,114,114,0.85)' }}>{result.failed} no match</span></> : null}
-                .
-              </>
-            )
           ) : (
             <>Re-scan failed: {result.error || 'unknown error'}</>
           )}

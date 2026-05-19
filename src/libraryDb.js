@@ -827,6 +827,18 @@ export async function updateAlbumMetadata(trackIds, fields) {
     sets.push('genre = ?');
     baseArgs.push(v || null);
   }
+  if ('explicit' in fields) {
+    // Same conversion as updateTrackMetadata: boolean true/false → 1/0,
+    // null clears the column. Bulk callers use this to flip an entire
+    // album's explicit flag in one go.
+    let v = null;
+    if (fields.explicit === true) v = 1;
+    else if (fields.explicit === false) v = 0;
+    else if (fields.explicit == null) v = null;
+    else return { ok: false, error: 'Explicit must be boolean or null.' };
+    sets.push('explicit = ?');
+    baseArgs.push(v);
+  }
   if ('coverArt' in fields) {
     let cover_art_url = null;
     const raw = fields.coverArt;
