@@ -45,36 +45,29 @@ export function useToastBus() {
   return { toasts, pushToast, dismissToast };
 }
 
-export function ToastStack({ toasts, onDismiss, pushToast, accent = '128, 128, 128', topOffset = 24, showDebugger = true }) {
+export function ToastStack({ toasts, onDismiss, accent = '128, 128, 128', topOffset = 24 }) {
   return (
-    <>
-      <div
-        style={{
-          position: 'fixed',
-          top: topOffset,
-          left: '50%',
-          transform: 'translateX(-50%)',
-          zIndex: 60,
-          display: 'flex',
-          flexDirection: 'column-reverse', 
-          gap: 10,
-          pointerEvents: 'none',
-          maxWidth: 'min(440px, calc(100vw - 24px))',
-          width: '100%',
-          alignItems: 'center',
-          perspective: '1200px',
-        }}
-      >
-        {toasts && toasts.map((t) => (
-          <ToastRow key={t.id} toast={t} onDismiss={onDismiss} accent={accent} />
-        ))}
-      </div>
-
-      {/* FLOATING TESTER CONTROLS */}
-      {showDebugger && pushToast && (
-        <ToastDebugger pushToast={pushToast} />
-      )}
-    </>
+    <div
+      style={{
+        position: 'fixed',
+        top: topOffset,
+        left: '50%',
+        transform: 'translateX(-50%)',
+        zIndex: 60,
+        display: 'flex',
+        flexDirection: 'column-reverse', 
+        gap: 10,
+        pointerEvents: 'none',
+        maxWidth: 'min(440px, calc(100vw - 24px))',
+        width: '100%',
+        alignItems: 'center',
+        perspective: '1200px',
+      }}
+    >
+      {toasts && toasts.map((t) => (
+        <ToastRow key={t.id} toast={t} onDismiss={onDismiss} accent={accent} />
+      ))}
+    </div>
   );
 }
 
@@ -270,77 +263,6 @@ function ToastRow({ toast, onDismiss, accent }) {
           <line x1="6" y1="6" x2="18" y2="18" />
           <line x1="18" y1="6" x2="6" y2="18" />
         </svg>
-      </button>
-    </div>
-  );
-}
-
-/**
- * Standalone Testing Utility UI Component
- */
-function ToastDebugger({ pushToast }) {
-  const btnStyle = {
-    padding: '6px 10px',
-    borderRadius: '6px',
-    border: '1px solid rgba(255,255,255,0.1)',
-    background: 'rgba(255,255,255,0.05)',
-    color: 'rgba(255,255,255,0.8)',
-    fontSize: '11px',
-    fontWeight: '600',
-    cursor: 'pointer',
-    transition: 'all 0.15s ease',
-  };
-
-  const triggerTest = (type) => {
-    if (type === 'success') {
-      pushToast({
-        message: "Added 'Midnight City' to your queue.",
-        kind: 'success',
-        action: { label: 'Undo', onClick: () => console.log('Undo triggered!') }
-      });
-    } else if (type === 'error') {
-      pushToast({
-        message: 'Failed to update playlist. Connection lost.',
-        kind: 'error',
-        durationMs: 0
-      });
-    } else {
-      pushToast({
-        message: 'Syncing music library with cloud backup...',
-        kind: 'info'
-      });
-    }
-  };
-
-  return (
-    <div
-      style={{
-        position: 'fixed',
-        bottom: '20px',
-        right: '20px',
-        zIndex: 9999,
-        display: 'flex',
-        flexDirection: 'column',
-        gap: '6px',
-        padding: '10px',
-        borderRadius: '12px',
-        background: 'rgba(15, 15, 17, 0.85)',
-        backdropFilter: 'blur(12px)',
-        border: '1px solid rgba(255,255,255,0.06)',
-        boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
-      }}
-    >
-      <div style={{ color: 'rgba(255,255,255,0.4)', fontSize: '9px', fontWeight: '700', letterSpacing: '0.5px', textTransform: 'uppercase', marginBottom: '2px', textAlign: 'center' }}>
-        Toast Engine Lab
-      </div>
-      <button type="button" style={btnStyle} onClick={() => triggerTest('success')} onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(123, 225, 145, 0.15)'} onMouseLeave={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.05)'}>
-        💥 Test Success
-      </button>
-      <button type="button" style={btnStyle} onClick={() => triggerTest('info')} onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.15)'} onMouseLeave={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.05)'}>
-        ✨ Test Info
-      </button>
-      <button type="button" style={btnStyle} onClick={() => triggerTest('error')} onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(243, 114, 114, 0.15)'} onMouseLeave={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.05)'}>
-        🚨 Test Error
       </button>
     </div>
   );
