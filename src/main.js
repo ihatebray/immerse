@@ -82,6 +82,12 @@ import {
   getValidUserToken,
   SPOTIFY_OAUTH_PORT,
 } from './spotifyClient.js';
+import {
+  itunesSearchTracks,
+  itunesSearchAlbums,
+  itunesGetAlbumTracks,
+  itunesCrossCheck,
+} from './itunesClient.js';
 import http from 'http';
 import { downloadYoutubeAudioForQuery, downloadYoutubeAudioById, searchCandidatesForPicker } from './ytdlpImport.js';
 import {
@@ -387,6 +393,76 @@ function emitUpdaterStatus(patch) {
   catch { /* window closed */ }
 }
 
+/**
+ * True if an error from a Spotify call looks like a rate-limit (429).
+ * Spotify's Dev-Mode rate-limit windows can last hours, so when we see
+ * this we stop hitting Spotify and fall back to iTunes.
+ */
+function isRateLimitError(e) {
+  const msg = String(e?.message || e || '');
+  return msg.includes('429') || /rate.?limit/i.test(msg);
+}
+
+/**
+ * Tell the renderer we've switched to the iTunes fallback. The UI shows
+ * a toast/notice so the user understands why search or metadata is
+ * coming from a different source. `reason` is 'ratelimit' or 'nocreds'.
+ *
+ * We debounce this so a burst of fallbacks (e.g. importing 30 playlist
+ * tracks while Spotify is rate-limited) only notifies once per minute
+ * rather than 30 times.
+ */
+let lastItunesNoticeAt = 0;
+function emitItunesFallbackNotice(reason) {
+  const now = Date.now();
+  if (now - lastItunesNoticeAt < 60_000) return;
+  lastItunesNoticeAt = now;
+  try { mainWindow?.webContents.send('metadata:providerSwitched', { provider: 'itunes', reason }); }
+  catch { /* window closed */ }
+}
+
+/**
+ * Provider-agnostic track cross-check used by all import/download
+ * paths. Tries Spotify first (if configured), falls back to iTunes
+ * when Spotify isn't configured or returns a rate-limit error.
+ *
+ * `target` = { title, artist, album?, durationMs? }. Pass the file's
+ * real decoded duration as durationMs whenever available — it's the
+ * strongest signal for iTunes matching (separates the real track from
+ * live/remix/edit versions sharing a title).
+ *
+ * Returns a track-shaped object (see spotifyClient/itunesClient) or
+ * null if neither provider had a confident match.
+ */
+async function crossCheckMetadata(target) {
+  const title = String(target?.title || '').trim();
+  if (!title) return null;
+
+  // Spotify path first, when creds exist.
+  if (spotifyCredentialsConfigured()) {
+    try {
+      const cand = await spotifyCrossCheck(target);
+      if (cand) return cand;
+      // No Spotify match — fall through to iTunes as a second opinion.
+    } catch (e) {
+      // Any Spotify error (rate-limit, bad credentials, network) →
+      // notify and fall through to iTunes. Rate-limit gets a more
+      // specific reason for the toast.
+      emitItunesFallbackNotice(isRateLimitError(e) ? 'ratelimit' : 'spotifyerror');
+    }
+  } else {
+    // No Spotify creds at all → iTunes is the only option.
+    emitItunesFallbackNotice('nocreds');
+  }
+
+  // iTunes fallback.
+  try {
+    return await itunesCrossCheck(target);
+  } catch {
+    return null;
+  }
+}
+
 async function initAutoUpdater() {
   if (updaterInitialized) return;
   updaterInitialized = true;
@@ -576,6 +652,57 @@ ipcMain.handle('whatsnew:fetchReleaseNotes', async (_e, version) => {
       url: String(data.html_url || ''),
       publishedAt: data.published_at || null,
     };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
+/**
+ * Fetch every GitHub Release for the repo, ordered newest-first.
+ *
+ * Used by the Settings → Update History overlay so users can flip
+ * back through every version of the app. GitHub's default page size
+ * is 30, which is plenty for the foreseeable future — we don't
+ * paginate because hitting 30 releases would mean the app's been
+ * iterating for a while and we'd want to rethink the UI by then
+ * anyway.
+ *
+ * Returns `{ ok, releases: [...], error? }`. Each release entry has
+ * `{ version, name, body, url, publishedAt, draft, prerelease }`.
+ * Draft releases (not yet published) are filtered out client-side;
+ * everything else (including pre-releases and known-broken old
+ * versions) is included verbatim — the overlay shows them all so
+ * users see the full timeline.
+ */
+ipcMain.handle('whatsnew:fetchAllReleases', async () => {
+  const url = 'https://api.github.com/repos/ihatebray/immerse/releases?per_page=100';
+  try {
+    const res = await fetch(url, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'immerse-app',
+      },
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      return { ok: false, error: `GitHub API ${res.status}: ${txt.slice(0, 200)}` };
+    }
+    const data = await res.json();
+    if (!Array.isArray(data)) return { ok: false, error: 'Unexpected GitHub response.' };
+    const releases = data
+      .filter((r) => !r.draft)
+      .map((r) => ({
+        // Tag names like "v1.0.5" → "1.0.5" for comparison; keep the
+        // raw tag too in case callers want it.
+        version: String((r.tag_name || '').replace(/^v/, '')),
+        tagName: String(r.tag_name || ''),
+        name: String(r.name || r.tag_name || ''),
+        body: String(r.body || '').trim(),
+        url: String(r.html_url || ''),
+        publishedAt: r.published_at || null,
+        prerelease: !!r.prerelease,
+      }));
+    return { ok: true, releases };
   } catch (e) {
     return { ok: false, error: String(e?.message || e) };
   }
@@ -1641,18 +1768,54 @@ ipcMain.handle('spotify:getMyPlaylists', async () => {
 ipcMain.handle('spotify:search', async (event, query) => {
   const q = String(query || '').trim();
   if (!q) return [];
-  return spotifySearchTracks(q);
+  // Spotify first when configured; iTunes fallback on ANY Spotify
+  // error (rate-limit, bad credentials, network) or missing creds. The
+  // renderer is notified via metadata:providerSwitched so it can show
+  // "now searching iTunes" to the user.
+  if (spotifyCredentialsConfigured()) {
+    try {
+      const r = await spotifySearchTracks(q);
+      if (Array.isArray(r) && r.length) return r;
+      // Empty result — try iTunes as a second opinion rather than
+      // returning nothing.
+      const it = await itunesSearchTracks(q);
+      return it.length ? it : r;
+    } catch (e) {
+      emitItunesFallbackNotice(isRateLimitError(e) ? 'ratelimit' : 'spotifyerror');
+      return itunesSearchTracks(q);
+    }
+  }
+  emitItunesFallbackNotice('nocreds');
+  return itunesSearchTracks(q);
 });
 
 ipcMain.handle('spotify:searchAlbums', async (event, query) => {
   const q = String(query || '').trim();
   if (!q) return [];
-  return spotifySearchAlbums(q);
+  if (spotifyCredentialsConfigured()) {
+    try {
+      const r = await spotifySearchAlbums(q);
+      if (Array.isArray(r) && r.length) return r;
+      const it = await itunesSearchAlbums(q);
+      return it.length ? it : r;
+    } catch (e) {
+      emitItunesFallbackNotice(isRateLimitError(e) ? 'ratelimit' : 'spotifyerror');
+      return itunesSearchAlbums(q);
+    }
+  }
+  emitItunesFallbackNotice('nocreds');
+  return itunesSearchAlbums(q);
 });
 
 ipcMain.handle('spotify:albumTracks', async (event, albumId) => {
   const id = String(albumId || '').trim();
   if (!id) return { album: '', artists: '', albumArtUrl: '', tracks: [] };
+  // iTunes albums carry an "itunes:" prefix on their ID (set in
+  // itunesSearchAlbums) so we can route them to the iTunes lookup
+  // endpoint instead of Spotify's album endpoint.
+  if (id.startsWith('itunes:')) {
+    return itunesGetAlbumTracks(id.slice('itunes:'.length));
+  }
   return spotifyGetAlbumTracks(id);
 });
 
@@ -2289,12 +2452,15 @@ async function ingestSoulseekFile({ downloadedPath, originalFilename }) {
   // editor handles anything the cross-check misses.
   let explicit = typeof parsed.explicit === 'boolean' ? parsed.explicit : null;
 
-  // Spotify cross-check. If we have a confident match, replace metadata
-  // with their canonical values. Cover art prefers Spotify's (consistent
-  // album art across the library) but falls back to the file's embedded
-  // art if Spotify's image fetch fails.
+  // Metadata cross-check. Tries Spotify first, falls back to iTunes
+  // when Spotify is unconfigured or rate-limited. We pass the file's
+  // real decoded duration — it's the strongest signal for the iTunes
+  // matcher (separates the real track from live/remix versions).
   try {
-    const cand = await spotifyCrossCheck({ title, artist, album });
+    const cand = await crossCheckMetadata({
+      title, artist, album,
+      durationMs: duration > 0 ? Math.round(duration * 1000) : undefined,
+    });
     if (cand) {
       title = (cand.title || cand.name || title).trim();
       artist = (cand.artists || cand.artist || artist).trim();
@@ -2302,19 +2468,15 @@ async function ingestSoulseekFile({ downloadedPath, originalFilename }) {
       if (cand.trackNumber != null) trackNumber = cand.trackNumber;
       if (cand.discNumber != null) discNumber = cand.discNumber;
       if (cand.year != null) year = cand.year;
-      // Spotify's explicit flag is authoritative — soulseek-sourced
-      // MP3/FLAC files almost never have a usable explicit tag in
-      // their own metadata (ID3 has no standard frame for it).
-      // The cross-check already runs per-track for title/artist/cover
-      // anyway; tacking on the explicit flag is free with that call.
-      // The rate-limit risk that pushed us to remove the bulk rescan
-      // doesn't apply here — these are one-off calls per download,
-      // not 100+ requests in a burst.
+      // Explicit flag from whichever provider matched. Spotify gives a
+      // boolean; iTunes gives true/false/null. Files almost never carry
+      // a usable explicit tag of their own, so the provider value wins
+      // when present.
       if (typeof cand.explicit === 'boolean') explicit = cand.explicit;
-      const spotifyArt = cand.albumArtUrl || cand.imageUrl;
-      if (spotifyArt) {
-        const dataUrl = await fetchSpotifyCoverAsDataUrl(spotifyArt);
-        if (dataUrl) { coverArt = dataUrl; coverArtUrl = spotifyArt; }
+      const art = cand.albumArtUrl || cand.imageUrl;
+      if (art) {
+        const dataUrl = await fetchSpotifyCoverAsDataUrl(art);
+        if (dataUrl) { coverArt = dataUrl; coverArtUrl = art; }
       }
     }
   } catch {
@@ -2793,6 +2955,22 @@ ipcMain.handle('playlist:importBatch', async (event, params = {}) => {
           try { coverStored = (await fetchSpotifyCoverAsDataUrl(t.albumArtUrl)) || t.albumArtUrl; }
           catch { coverStored = t.albumArtUrl; }
         }
+        // Explicit flag from the Spotify playlist data. If Spotify
+        // didn't supply one (null), try the cross-check (which falls
+        // back to iTunes) using the file's real duration to disambiguate
+        // versions. This catches tracks Spotify left unflagged.
+        let plExplicit = typeof t.explicit === 'boolean' ? t.explicit : null;
+        if (plExplicit === null) {
+          try {
+            const cand = await crossCheckMetadata({
+              title: t.title || parsed.title || '',
+              artist: t.artists || parsed.artist || '',
+              album: t.album || parsed.album || '',
+              durationMs: duration > 0 ? Math.round(duration * 1000) : undefined,
+            });
+            if (cand && typeof cand.explicit === 'boolean') plExplicit = cand.explicit;
+          } catch { /* leave null */ }
+        }
         const track = {
           id: newTrackId(),
           filePath: parsed.filePath,
@@ -2806,7 +2984,7 @@ ipcMain.handle('playlist:importBatch', async (event, params = {}) => {
           discNumber: t.discNumber ?? null,
           year: t.releaseDate ? Number((t.releaseDate || '').slice(0, 4)) || null : null,
           genre: parsed.genre || '',
-          explicit: typeof t.explicit === 'boolean' ? t.explicit : null,
+          explicit: plExplicit,
         };
         const res = await upsertTracks([track]);
         if (!res.ok) {

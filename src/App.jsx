@@ -56,6 +56,33 @@ function sortByTitle(arr) {
  * asset key. The next app restart would heal it (rowToTrack puts the
  * URL into coverArt), but that's a confusing user-visible inconsistency.
  */
+/**
+ * Map a linear slider value (0..1) to a perceptual audio gain (0..1).
+ *
+ * Human loudness perception is roughly logarithmic, so a linear volume
+ * slider feels wrong: it's already loud at 10% and most of the audible
+ * change happens in the bottom third. Applying a power curve makes the
+ * slider feel even across its whole range — genuinely quiet at the
+ * bottom, ramping up gradually, and unchanged at the very top.
+ *
+ * We use gain = value^EXPONENT. At EXPONENT = 2.5:
+ *   slider 1.0  → gain 1.000  (full, unchanged — keeps the "extremely loud" top)
+ *   slider 0.75 → gain 0.487
+ *   slider 0.5  → gain 0.177  (much quieter than the old linear 0.5)
+ *   slider 0.25 → gain 0.031
+ *   slider 0.1  → gain 0.003  (a real, quiet low end)
+ *   slider 0.0  → gain 0.000
+ *
+ * The top of the slider is intentionally untouched (1^2.5 = 1) so the
+ * loud ceiling everyone likes is preserved; only the lows and mids get
+ * pulled down so there's room to ramp.
+ */
+const VOLUME_CURVE_EXPONENT = 2.5;
+function perceptualVolume(linear) {
+  const v = Math.max(0, Math.min(1, Number(linear) || 0));
+  return Math.pow(v, VOLUME_CURVE_EXPONENT);
+}
+
 function mergeCoverArt(fromDb, batch) {
   if (!batch?.length) return fromDb;
   const rich = new Map(batch.map((t) => [t.filePath, t]));
@@ -201,6 +228,13 @@ export default function App() {
 
   const openTutorial = useCallback(() => setTutorialOpen(true), []);
 
+  // Update history overlay — Settings "View all releases" button opens
+  // a paged overlay showing every GitHub release for the repo. Fetched
+  // lazily on first open and cached for the session.
+  const [updateHistoryOpen, setUpdateHistoryOpen] = useState(false);
+  const openUpdateHistory = useCallback(() => setUpdateHistoryOpen(true), []);
+  const closeUpdateHistory = useCallback(() => setUpdateHistoryOpen(false), []);
+
   useEffect(() => {
     const api = typeof window !== 'undefined' ? window.electronAPI : null;
     if (!api?.onUpdateStatus) return undefined;
@@ -246,6 +280,30 @@ export default function App() {
     return () => { cancelled = true; if (typeof unsub === 'function') unsub(); };
   }, [pushToast]);
 
+  // Metadata provider fallback notice. When the main process switches
+  // from Spotify to iTunes (rate-limited, or no Spotify creds), it
+  // emits this — we toast so the user understands why search/metadata
+  // is coming from a different source. Debounced server-side to once
+  // per minute, so this won't spam during a bulk import.
+  useEffect(() => {
+    const api = typeof window !== 'undefined' ? window.electronAPI : null;
+    if (!api?.onMetadataProviderSwitched) return undefined;
+    const unsub = api.onMetadataProviderSwitched((payload) => {
+      const reason = payload?.reason;
+      let msg;
+      if (reason === 'nocreds') {
+        msg = 'No Spotify credentials set — using iTunes for search and metadata.';
+      } else if (reason === 'ratelimit') {
+        msg = 'Spotify is rate-limited — switched to iTunes for now.';
+      } else {
+        // 'spotifyerror' or anything else
+        msg = 'Spotify isn\'t responding — using iTunes instead. Check your Spotify credentials in Settings.';
+      }
+      pushToast({ message: msg, kind: 'info', durationMs: 6000 });
+    });
+    return () => { if (typeof unsub === 'function') unsub(); };
+  }, [pushToast]);
+
   /** Recent releases (within last 30 days) for followed artists — cached server-side. */
   const [releases, setReleases] = useState([]);
   /** Manual follow-overrides: [{ artistName, action: 'add' | 'exclude', itunesArtistId }]. */
@@ -264,7 +322,25 @@ export default function App() {
   const [seekNonce, setSeekNonce] = useState(0);
   const [shuffleOn, setShuffleOn] = useState(false);
   const [repeat, setRepeat] = useState('off');
-  const [volume, setVolume] = useState(1);
+  // Volume persists across launches. Defaults to 30% on first launch
+  // so the app doesn't blast at full volume the first time. After that
+  // it remembers whatever the user last set.
+  const [volume, setVolume] = useState(() => {
+    if (typeof window === 'undefined') return 0.3;
+    try {
+      const raw = window.localStorage.getItem('immerse:volume');
+      if (raw == null) return 0.3;
+      const n = Number(raw);
+      if (Number.isFinite(n) && n >= 0 && n <= 1) return n;
+      return 0.3;
+    } catch {
+      return 0.3;
+    }
+  });
+  useEffect(() => {
+    try { window.localStorage.setItem('immerse:volume', String(volume)); }
+    catch { /* ignore */ }
+  }, [volume]);
 
   /**
    * isMaximized — tracks whether the window is currently maximized
@@ -1047,7 +1123,7 @@ export default function App() {
 
   useEffect(() => {
     audioRef.current = new Audio();
-    audioRef.current.volume = volume;
+    audioRef.current.volume = perceptualVolume(volume);
     return () => {
       if (audioRef.current) {
         audioRef.current.pause();
@@ -1348,7 +1424,7 @@ export default function App() {
     // Intentionally omit `currentTrack.duration`: metadata hydration updates it and must not reload `src` (that restarts playback).
   }, [currentIndex, currentTrack?.id, currentTrack?.filePath, currentTrack?.objectUrl]);
 
-  useEffect(() => { if (audioRef.current) audioRef.current.volume = volume; }, [volume]);
+  useEffect(() => { if (audioRef.current) audioRef.current.volume = perceptualVolume(volume); }, [volume]);
 
   const togglePlay = () => {
     if (!currentTrack) {
@@ -2413,6 +2489,7 @@ export default function App() {
         spotifyCredsRefreshKey={spotifyCredsRefreshKey}
         onSpotifyCredsSaved={handleSpotifyCredsSaved}
         onOpenTutorial={openTutorial}
+        onOpenUpdateHistory={openUpdateHistory}
         onPlayTrack={playTrack}
         onPlayPauseTrack={playPauseLibraryRow}
         onTogglePlay={togglePlay}
@@ -2649,6 +2726,11 @@ export default function App() {
       {tutorialOpen ? (
         <Tutorial onClose={dismissTutorial} />
       ) : null}
+      {/* Update history overlay — on-demand from Settings. Fetches the
+          full list of GitHub releases and lets users page through them. */}
+      {updateHistoryOpen ? (
+        <UpdateHistoryOverlay onClose={closeUpdateHistory} />
+      ) : null}
     </div>
   );
 }
@@ -2815,6 +2897,287 @@ function WhatsNewOverlay({ data, onClose }) {
             Got it
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * UpdateHistoryOverlay — paged view of every GitHub release for the
+ * repo. Triggered by Settings → "View all releases" button.
+ *
+ * Shape mirrors WhatsNewOverlay (same modal styling, same MarkdownLite
+ * renderer) but adds prev/next arrow navigation along the bottom so
+ * users can flip through releases without dismissing.
+ *
+ * Behavior:
+ *   - Fetches all releases on mount. Shows a loading spinner until done.
+ *   - Initial page is the FIRST release in the list (newest), which is
+ *     usually the version the user is currently running.
+ *   - Prev/Next arrows wrap around — clicking next on the last release
+ *     loops to the first. Same for prev. (Disabling at the edges felt
+ *     too restrictive for a small list.)
+ *   - Page indicator at the bottom shows "N of M" + a row of dots so
+ *     the user can see where they are in the timeline at a glance.
+ *
+ * Releases that pre-date the working auto-updater (v1.0.0 - v1.0.3 in
+ * Immerse's case) are shown as-is. The user explicitly asked NOT to
+ * filter them; this is meant to be a complete record.
+ */
+function UpdateHistoryOverlay({ onClose }) {
+  const [releases, setReleases] = useState(null); // null = loading, [] = empty/error, [...] = loaded
+  const [error, setError] = useState('');
+  const [idx, setIdx] = useState(0);
+
+  useEffect(() => {
+    const api = typeof window !== 'undefined' ? window.electronAPI : null;
+    if (!api?.whatsnewFetchAllReleases) {
+      setError('Update history is only available in the desktop app.');
+      setReleases([]);
+      return undefined;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await api.whatsnewFetchAllReleases();
+        if (cancelled) return;
+        if (r?.ok && Array.isArray(r.releases)) {
+          setReleases(r.releases);
+        } else {
+          setError(r?.error || 'Could not load release history.');
+          setReleases([]);
+        }
+      } catch (e) {
+        if (cancelled) return;
+        setError(String(e?.message || e));
+        setReleases([]);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Escape dismisses; left/right arrows navigate.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        onClose?.();
+      } else if (e.key === 'ArrowRight' && Array.isArray(releases) && releases.length > 1) {
+        setIdx((i) => (i + 1) % releases.length);
+      } else if (e.key === 'ArrowLeft' && Array.isArray(releases) && releases.length > 1) {
+        setIdx((i) => (i - 1 + releases.length) % releases.length);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [releases, onClose]);
+
+  const current = Array.isArray(releases) && releases.length > 0 ? releases[idx] : null;
+  const dateLine = useMemo(() => {
+    if (!current?.publishedAt) return '';
+    try {
+      const d = new Date(current.publishedAt);
+      return d.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
+    } catch { return ''; }
+  }, [current]);
+
+  return (
+    <div
+      onMouseDown={(e) => { if (e.target === e.currentTarget) onClose?.(); }}
+      style={{
+        position: 'fixed', inset: 0, zIndex: 100,
+        background: 'rgba(0,0,0,0.55)',
+        backdropFilter: 'blur(10px)', WebkitBackdropFilter: 'blur(10px)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: 24,
+      }}
+    >
+      <div style={{
+        width: 'min(560px, 100%)',
+        maxHeight: 'calc(100vh - 80px)',
+        display: 'flex', flexDirection: 'column',
+        borderRadius: 18,
+        background: 'rgba(22, 22, 24, 0.88)',
+        backdropFilter: 'blur(40px) saturate(1.6)', WebkitBackdropFilter: 'blur(40px) saturate(1.6)',
+        border: '1px solid rgba(255,255,255,0.1)',
+        boxShadow: '0 24px 60px rgba(0,0,0,0.6), 0 0 0 1px rgba(29,185,84,0.12), inset 0 1px 0 rgba(255,255,255,0.06)',
+        overflow: 'hidden',
+      }}>
+        {/* Header */}
+        <div style={{
+          padding: '18px 22px 14px',
+          borderBottom: '1px solid rgba(255,255,255,0.06)',
+          display: 'flex', alignItems: 'flex-start', gap: 14,
+        }}>
+          <div style={{
+            flexShrink: 0,
+            width: 38, height: 38,
+            borderRadius: 10,
+            background: 'rgba(29,185,84,0.16)',
+            border: '1px solid rgba(29,185,84,0.4)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: 18,
+          }}>
+            <span aria-hidden style={{ color: '#1db954' }}>📜</span>
+          </div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{
+              fontSize: 10.5, letterSpacing: 0.6, textTransform: 'uppercase',
+              color: '#1db954', fontWeight: 700,
+            }}>
+              Update history
+            </div>
+            <div style={{
+              fontSize: 18, fontWeight: 600, color: '#fff',
+              marginTop: 2,
+              whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+            }}>
+              {current?.name || (releases === null ? 'Loading…' : 'No releases')}
+              {current?.prerelease ? (
+                <span style={{
+                  marginLeft: 8, fontSize: 10, fontWeight: 700,
+                  padding: '2px 6px', borderRadius: 4,
+                  background: 'rgba(243,170,114,0.15)',
+                  color: 'rgba(243,170,114,0.95)',
+                  textTransform: 'uppercase', letterSpacing: 0.5,
+                  verticalAlign: 'middle',
+                }}>
+                  pre
+                </span>
+              ) : null}
+            </div>
+            {dateLine ? (
+              <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.45)', marginTop: 2 }}>
+                Released {dateLine}
+              </div>
+            ) : null}
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            style={{
+              flexShrink: 0,
+              width: 28, height: 28,
+              borderRadius: 8,
+              border: '1px solid rgba(255,255,255,0.1)',
+              background: 'rgba(255,255,255,0.04)',
+              color: 'rgba(255,255,255,0.7)',
+              cursor: 'pointer',
+              fontSize: 14,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}
+          >
+            ×
+          </button>
+        </div>
+
+        {/* Body */}
+        <div style={{
+          flex: 1,
+          overflowY: 'auto',
+          padding: '14px 22px 18px',
+          fontSize: 12.5,
+          lineHeight: 1.65,
+          color: 'rgba(255,255,255,0.82)',
+        }}>
+          {releases === null ? (
+            <div style={{ textAlign: 'center', padding: '40px 0', color: 'rgba(255,255,255,0.4)', fontSize: 11.5 }}>
+              Loading release history…
+            </div>
+          ) : error ? (
+            <div style={{
+              padding: '12px 14px', borderRadius: 8,
+              background: 'rgba(243,114,114,0.1)',
+              border: '1px solid rgba(243,114,114,0.25)',
+              color: '#f37272', fontSize: 11.5,
+            }}>
+              {error}
+            </div>
+          ) : releases.length === 0 ? (
+            <div style={{ textAlign: 'center', padding: '40px 0', color: 'rgba(255,255,255,0.4)', fontSize: 11.5 }}>
+              No releases yet.
+            </div>
+          ) : !current?.body ? (
+            <div style={{
+              padding: '12px 14px', borderRadius: 8,
+              background: 'rgba(255,255,255,0.04)',
+              color: 'rgba(255,255,255,0.55)', fontSize: 11.5,
+              fontStyle: 'italic',
+            }}>
+              No release notes were written for this version.
+            </div>
+          ) : (
+            <MarkdownLite text={current.body} />
+          )}
+          {current?.url ? (
+            <a
+              href={current.url}
+              target="_blank"
+              rel="noreferrer"
+              style={{
+                display: 'inline-block', marginTop: 14,
+                fontSize: 11, color: 'rgba(255,255,255,0.45)',
+                borderBottom: '1px solid rgba(255,255,255,0.15)',
+                textDecoration: 'none',
+              }}
+            >
+              View on GitHub →
+            </a>
+          ) : null}
+        </div>
+
+        {/* Footer with prev/next paging */}
+        {Array.isArray(releases) && releases.length > 0 ? (
+          <div style={{
+            padding: '12px 16px 14px',
+            borderTop: '1px solid rgba(255,255,255,0.06)',
+            display: 'flex', alignItems: 'center', gap: 10,
+          }}>
+            <button
+              type="button"
+              onClick={() => setIdx((i) => (i - 1 + releases.length) % releases.length)}
+              disabled={releases.length <= 1}
+              aria-label="Previous release"
+              style={{
+                width: 32, height: 32, borderRadius: 8,
+                border: '1px solid rgba(255,255,255,0.1)',
+                background: 'rgba(255,255,255,0.04)',
+                color: releases.length <= 1 ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.8)',
+                fontSize: 14,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                cursor: releases.length <= 1 ? 'default' : 'pointer',
+              }}
+            >
+              ‹
+            </button>
+            <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
+              {/* Dot row, with a numeric label so 30 dots aren't too dense to read */}
+              <div style={{
+                fontSize: 11, color: 'rgba(255,255,255,0.5)', fontVariantNumeric: 'tabular-nums',
+                minWidth: 50, textAlign: 'center',
+              }}>
+                {idx + 1} of {releases.length}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setIdx((i) => (i + 1) % releases.length)}
+              disabled={releases.length <= 1}
+              aria-label="Next release"
+              style={{
+                width: 32, height: 32, borderRadius: 8,
+                border: '1px solid rgba(255,255,255,0.1)',
+                background: 'rgba(255,255,255,0.04)',
+                color: releases.length <= 1 ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.8)',
+                fontSize: 14,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                cursor: releases.length <= 1 ? 'default' : 'pointer',
+              }}
+            >
+              ›
+            </button>
+          </div>
+        ) : null}
       </div>
     </div>
   );

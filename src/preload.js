@@ -65,6 +65,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   whatsnewGetLastSeen: () => ipcRenderer.invoke('whatsnew:getLastSeen'),
   whatsnewSetLastSeen: (version) => ipcRenderer.invoke('whatsnew:setLastSeen', version),
   whatsnewFetchReleaseNotes: (version) => ipcRenderer.invoke('whatsnew:fetchReleaseNotes', version),
+  whatsnewFetchAllReleases: () => ipcRenderer.invoke('whatsnew:fetchAllReleases'),
+  // Metadata provider switch notice (Spotify → iTunes fallback)
+  onMetadataProviderSwitched: (cb) => {
+    const listener = (_event, payload) => cb(payload);
+    ipcRenderer.on('metadata:providerSwitched', listener);
+    return () => ipcRenderer.removeListener('metadata:providerSwitched', listener);
+  },
   // First-run tutorial flag
   tutorialGetSeen: () => ipcRenderer.invoke('tutorial:getSeen'),
   tutorialSetSeen: (seen) => ipcRenderer.invoke('tutorial:setSeen', seen),

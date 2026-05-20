@@ -356,74 +356,30 @@ export async function getValidUserToken() {
 /**
  * Low-level GET helper for Spotify API calls.
  *
- * Handles 429 rate limiting automatically by reading the `Retry-After`
- * response header and waiting that long before retrying. The header
- * is given in seconds; we add a small jitter (250ms) on top so multiple
- * concurrent retries don't all wake up at exactly the same moment and
- * re-trigger the limit immediately.
- *
- * Caps the retry wait at 30 seconds — anything longer than that we
- * surface as an error rather than blocking the caller indefinitely.
- * Tools like the rescan handler can then back off further on their own
- * (e.g. pause the whole batch for a minute) rather than hanging here.
- *
- * Number of retries is capped at 2. Most 429s are transient (5–30
- * seconds); if we hit it three times in a row, the caller deserves to
- * see the error and decide what to do.
+ * We do NOT retry on 429. Spotify's rate-limit windows for the
+ * Client-Credentials / Dev-Mode tier can last many hours (often a full
+ * day), so retrying in-process is pointless — it just delays the
+ * inevitable error. Instead we surface the 429 immediately so callers
+ * can fall back to iTunes (see crossCheckMetadata in main.js).
  */
 async function spotifyGet(urlStr) {
-  const MAX_RETRIES = 2;
-  const MAX_RETRY_WAIT_MS = 30_000;
-
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const token = await getSpotifyAccessToken();
-    const res = await fetch(urlStr, {
-      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-    });
-
-    // 429: read Retry-After, sleep, retry. The header is in whole
-    // seconds for Spotify. Some upstream proxies serve an HTTP-date
-    // instead, but Spotify itself uses seconds — we handle both
-    // defensively just in case.
-    if (res.status === 429 && attempt < MAX_RETRIES) {
-      const retryAfter = res.headers.get('Retry-After');
-      let waitMs = 0;
-      if (retryAfter) {
-        const n = Number(retryAfter);
-        if (Number.isFinite(n) && n > 0) {
-          waitMs = n * 1000;
-        } else {
-          // Fallback for HTTP-date format
-          const t = Date.parse(retryAfter);
-          if (Number.isFinite(t)) waitMs = Math.max(0, t - Date.now());
-        }
-      }
-      // Default to 5s if header missing/unparseable. Add 250ms jitter
-      // so concurrent retries don't all fire simultaneously.
-      if (!waitMs) waitMs = 5000;
-      waitMs = Math.min(MAX_RETRY_WAIT_MS, waitMs + 250);
-      console.warn(`[spotify] rate limited (429), waiting ${waitMs}ms before retry ${attempt + 1}/${MAX_RETRIES}`);
-      await new Promise((resolve) => setTimeout(resolve, waitMs));
-      continue;
+  const token = await getSpotifyAccessToken();
+  const res = await fetch(urlStr, {
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    let detail = text.slice(0, 400);
+    try {
+      const j = JSON.parse(text);
+      const msg = j?.error?.message ?? j?.error;
+      if (typeof msg === 'string' && msg.trim()) detail = msg.trim();
+    } catch {
+      /* keep raw slice */
     }
-
-    const text = await res.text();
-    if (!res.ok) {
-      let detail = text.slice(0, 400);
-      try {
-        const j = JSON.parse(text);
-        const msg = j?.error?.message ?? j?.error;
-        if (typeof msg === 'string' && msg.trim()) detail = msg.trim();
-      } catch {
-        /* keep raw slice */
-      }
-      throw new Error(`Spotify API (${res.status}): ${detail}`);
-    }
-    return JSON.parse(text);
+    throw new Error(`Spotify API (${res.status}): ${detail}`);
   }
-
-  // Exhausted retries
-  throw new Error('Spotify API (429): rate limited; retries exhausted');
+  return JSON.parse(text);
 }
 /**
  * Catalogue search `q` has a strict undocumented length cap; long strings often yield HTTP 400.

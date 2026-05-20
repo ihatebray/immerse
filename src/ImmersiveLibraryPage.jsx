@@ -193,6 +193,7 @@ export default function ImmersiveLibraryPage({
   spotifyCredsRefreshKey,
   onSpotifyCredsSaved,
   onOpenTutorial,
+  onOpenUpdateHistory,
   onPlayTrack,
   onPlayPauseTrack,
   onTogglePlay,
@@ -1868,6 +1869,7 @@ export default function ImmersiveLibraryPage({
         collapsed={dockCollapsed}
         onToggleCollapsed={() => setDockCollapsed((v) => !v)}
         onOpenTutorial={onOpenTutorial}
+        onOpenUpdateHistory={onOpenUpdateHistory}
         side={dockSide}
         tab={dockTab}
         onTabChange={setDockTab}
@@ -7043,6 +7045,8 @@ function SideDock({
   // SettingsTab rendered inside this component can wire its
   // "Open tutorial" button.
   onOpenTutorial,
+  // Update history trigger — same pattern as onOpenTutorial.
+  onOpenUpdateHistory,
   tab,
   onTabChange,
   tracks,
@@ -7561,6 +7565,7 @@ function SideDock({
             contextMenusEnabled={contextMenusEnabled}
             onSetContextMenusEnabled={onSetContextMenusEnabled}
             onOpenTutorial={onOpenTutorial}
+            onOpenUpdateHistory={onOpenUpdateHistory}
           />
         ) : tab === 'stats' ? (
           <StatsTab
@@ -17253,6 +17258,7 @@ function SettingsTab({
   uiFontStack,
   onSpotifyCredsSaved,
   onOpenTutorial,
+  onOpenUpdateHistory,
   animateGradient = true,
   onSetAnimateGradient,
   beatReactive = false,
@@ -17649,6 +17655,45 @@ function SettingsTab({
           </button>
         ) : null}
       </div>
+
+      {/* Update history — opens the paged overlay with every release.
+          Placed at the very top so it's the first thing visible when
+          opening Settings, since "what changed recently" is a common
+          first question. */}
+      {typeof onOpenUpdateHistory === 'function' ? (
+        <button
+          type="button"
+          onClick={onOpenUpdateHistory}
+          style={{
+            marginBottom: 14,
+            padding: '9px 12px',
+            display: 'flex', alignItems: 'center', gap: 10,
+            width: '100%',
+            borderRadius: 10,
+            border: '1px solid rgba(29,185,84,0.25)',
+            background: 'rgba(29,185,84,0.08)',
+            color: 'rgba(255,255,255,0.85)',
+            fontSize: 11.5, fontWeight: 600,
+            cursor: 'pointer',
+            transition: 'background 0.15s, border-color 0.15s',
+            textAlign: 'left',
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.background = 'rgba(29,185,84,0.14)';
+            e.currentTarget.style.borderColor = 'rgba(29,185,84,0.4)';
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = 'rgba(29,185,84,0.08)';
+            e.currentTarget.style.borderColor = 'rgba(29,185,84,0.25)';
+          }}
+        >
+          <span aria-hidden style={{ fontSize: 14 }}>📜</span>
+          <span style={{ flex: 1 }}>View update history</span>
+          <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', fontWeight: 500 }}>
+            see all releases →
+          </span>
+        </button>
+      ) : null}
 
       {/* Appearance */}
       <Section title="APPEARANCE">

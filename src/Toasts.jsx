@@ -1,62 +1,19 @@
 /**
- * Toasts.jsx — bottom-corner non-blocking notifications.
+ * Toasts.jsx — Symmetrical 3D Kinetic Notification Stack
  *
- * Why this exists: most successful actions in the app do their work
- * silently — adding tracks to a queue, saving to a playlist, removing
- * tracks from the library. With nothing to confirm the action
- * happened, the user is left wondering if it worked. Toasts give a
- * subtle, time-bound acknowledgement that doesn't block the UI.
- *
- * The system is intentionally tiny:
- *   - One `useToastBus()` hook owns the toast state + dispatch
- *   - One `<ToastStack />` renders the toasts in a fixed-position
- *     stack at the bottom of the viewport
- *   - Toasts auto-dismiss after `durationMs` (default 5 seconds) and
- *     can be manually dismissed by clicking
- *   - Each toast can have an `action` (label + handler) — used for
- *     undo. When clicked, the handler runs and the toast dismisses.
- *
- * Public surface:
- *   const { toasts, pushToast, dismissToast } = useToastBus();
- *
- *   pushToast({ message, kind, action?, durationMs? })
- *     - message:    string shown in the toast
- *     - kind:       'info' | 'success' | 'error'  (default 'info')
- *     - action:     { label, onClick }            (optional button)
- *     - durationMs: number                        (default 5000; pass
- *                                                 0 for sticky)
- *   Returns the toast id, in case the caller wants to dismiss it
- *   programmatically (e.g. when a follow-up action makes the toast
- *   stale before its timer fires).
- *
- *   dismissToast(id)
- *     - removes a toast, cancels its timer.
- *
- * Stylistically the toasts match the rest of the player chrome —
- * dark glass, light text, accent strip for the kind indicator. They
- * never use motion that competes with the music background — just
- * a quick slide-up-and-fade on enter, fade on exit.
+ * Implements a unified physics model where entrance and exit animations
+ * perfectly mirror each other. Banners swing down out of a 3D perspective
+ * plane on arrival, and snap smoothly back up into that exact same 3D 
+ * plane upon dismissal, preventing any jarring layout snaps.
  */
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 
 const DEFAULT_DURATION_MS = 5000;
-const MAX_VISIBLE_TOASTS = 4;  // older toasts get auto-dismissed when this is exceeded
+const MAX_VISIBLE_TOASTS = 4;
 
-/**
- * State + dispatch for the toast system. The hook itself is
- * intentionally dumb — it doesn't know about the UI or auto-dismiss
- * timing; <ToastStack /> handles render + timer management.
- *
- * Returning the live array of toasts (not a context) lets us pass it
- * down to <ToastStack /> as a prop, which matches the rest of the
- * codebase's prop-drilling style.
- */
 export function useToastBus() {
   const [toasts, setToasts] = useState([]);
-  // Counter for unique ids — date-now collides when multiple toasts
-  // arrive in the same millisecond (rare but possible in test
-  // scenarios and rapid action loops).
   const counterRef = useRef(0);
 
   const pushToast = useCallback((opts) => {
@@ -68,14 +25,11 @@ export function useToastBus() {
       message: String(opts.message),
       kind: opts.kind || 'info',
       action: opts.action || null,
-      // 0 means "sticky" — no auto-dismiss. Used for errors that
-      // require user attention.
       durationMs: typeof opts.durationMs === 'number' ? opts.durationMs : DEFAULT_DURATION_MS,
       createdAt: Date.now(),
     };
     setToasts((prev) => {
       const next = [...prev, toast];
-      // Cap the visible stack — drop oldest first.
       if (next.length > MAX_VISIBLE_TOASTS) {
         return next.slice(next.length - MAX_VISIBLE_TOASTS);
       }
@@ -91,70 +45,70 @@ export function useToastBus() {
   return { toasts, pushToast, dismissToast };
 }
 
-/**
- * Render the current toast stack. Auto-dismiss timers live here so
- * the bus hook stays state-only.
- *
- * Toasts render bottom-up (newest at the bottom of the stack) and
- * slide-in from below. Each one carries its own timer; clicking the
- * action button or the dismiss × cancels the timer immediately.
- *
- * Positioning: fixed at bottom-center, above the dock — the dock is
- * z:50 in this app's layering convention so we use z:60. On mobile-
- * sized viewports we shift slightly higher to clear the dock if it's
- * docked at the bottom edge.
- */
-export function ToastStack({ toasts, onDismiss, accent = '128, 128, 128', bottomOffset = 88 }) {
-  if (!toasts || toasts.length === 0) return null;
+export function ToastStack({ toasts, onDismiss, pushToast, accent = '128, 128, 128', topOffset = 24, showDebugger = true }) {
   return (
-    <div
-      style={{
-        position: 'fixed',
-        bottom: bottomOffset,
-        left: '50%',
-        transform: 'translateX(-50%)',
-        zIndex: 60,
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 8,
-        pointerEvents: 'none',
-        maxWidth: 'min(440px, calc(100vw - 24px))',
-        width: '100%',
-        alignItems: 'center',
-      }}
-    >
-      {toasts.map((t) => (
-        <ToastRow key={t.id} toast={t} onDismiss={onDismiss} accent={accent} />
-      ))}
-    </div>
+    <>
+      <div
+        style={{
+          position: 'fixed',
+          top: topOffset,
+          left: '50%',
+          transform: 'translateX(-50%)',
+          zIndex: 60,
+          display: 'flex',
+          flexDirection: 'column-reverse', 
+          gap: 10,
+          pointerEvents: 'none',
+          maxWidth: 'min(440px, calc(100vw - 24px))',
+          width: '100%',
+          alignItems: 'center',
+          perspective: '1200px',
+        }}
+      >
+        {toasts && toasts.map((t) => (
+          <ToastRow key={t.id} toast={t} onDismiss={onDismiss} accent={accent} />
+        ))}
+      </div>
+
+      {/* FLOATING TESTER CONTROLS */}
+      {showDebugger && pushToast && (
+        <ToastDebugger pushToast={pushToast} />
+      )}
+    </>
   );
 }
 
 function ToastRow({ toast, onDismiss, accent }) {
-  // Mount animation: starts off-screen + transparent, animates in on
-  // first paint. The `mounted` flag flips inside a useEffect so the
-  // browser has a chance to render the initial state before the
-  // transition kicks in.
   const [mounted, setMounted] = useState(false);
+  const [isExiting, setIsExiting] = useState(false);
+  const exitTimeoutRef = useRef(null);
+
   useEffect(() => {
     const id = requestAnimationFrame(() => setMounted(true));
     return () => cancelAnimationFrame(id);
   }, []);
 
-  // Auto-dismiss timer. 0 means sticky; non-zero schedules removal.
-  // We don't pause on hover (could add it as a refinement) — the
-  // duration is short enough that the user can re-trigger by repeating
-  // the action if they miss it.
+  const handleDismiss = useCallback(() => {
+    if (isExiting) return;
+    setIsExiting(true);
+    // Matches the duration of our master transition perfectly (320ms)
+    exitTimeoutRef.current = setTimeout(() => {
+      onDismiss(toast.id);
+    }, 320);
+  }, [isExiting, onDismiss, toast.id]);
+
   useEffect(() => {
     if (toast.durationMs <= 0) return undefined;
-    const id = setTimeout(() => onDismiss(toast.id), toast.durationMs);
+    const id = setTimeout(() => handleDismiss(), toast.durationMs);
     return () => clearTimeout(id);
-  }, [toast.id, toast.durationMs, onDismiss]);
+  }, [toast.id, toast.durationMs, handleDismiss]);
 
-  // Kind-aware accent strip: success uses a green that complements
-  // any cover accent; error uses the same red as the metadata-editor
-  // delete state; info uses the player's accent colour so the toast
-  // feels part of the current track's palette.
+  useEffect(() => {
+    return () => {
+      if (exitTimeoutRef.current) clearTimeout(exitTimeoutRef.current);
+    };
+  }, []);
+
   const stripColor =
     toast.kind === 'success' ? '#7be191'
     : toast.kind === 'error' ? '#f37272'
@@ -163,43 +117,107 @@ function ToastRow({ toast, onDismiss, accent }) {
   const handleAction = () => {
     if (!toast.action?.onClick) return;
     try { toast.action.onClick(); } catch (e) { console.error('toast action threw:', e); }
-    onDismiss(toast.id);
+    handleDismiss();
   };
+
+  // --- UNIFIED KINETIC STATES ---
+  // The unmounted state and the exiting state now share the exact same aesthetic coordinates,
+  // making the animation completely loopable and symmetrical.
+  const states = {
+    initial: {
+      transform: 'translateY(-40px) scale(0.88, 0.5) rotateX(-45deg)',
+      opacity: 0,
+      filter: 'blur(12px)',
+      maxHeight: '100px',
+      padding: '10px 14px 10px 16px',
+      gap: 12
+    },
+    active: {
+      transform: 'translateY(0) scale(1) rotateX(0deg)',
+      opacity: 1,
+      filter: 'blur(0px)',
+      maxHeight: '100px',
+      padding: '10px 14px 10px 16px',
+      gap: 12
+    },
+    exit: {
+      // Pulls perfectly back up into the ceiling plane
+      transform: 'translateY(-40px) scale(0.88, 0.5) rotateX(-45deg)',
+      opacity: 0,
+      filter: 'blur(12px)',
+      // Margins and heights collapse alongside the 3D retreat to smoothly slide up items below it
+      maxHeight: '0px',
+      padding: '0px 14px',
+      gap: 0
+    }
+  };
+
+  const currentStyle = isExiting ? states.exit : (mounted ? states.active : states.initial);
+
+  // A beautiful, highly-damped spring curve that works perfectly both forward and backward
+  const cubicCurve = 'cubic-bezier(0.25, 1, 0.5, 1)';
+  const masterTransition = `
+    transform 0.32s ${cubicCurve}, 
+    opacity 0.28s linear, 
+    filter 0.28s ease, 
+    max-height 0.32s ${cubicCurve}, 
+    padding 0.32s ${cubicCurve},
+    gap 0.32s ${cubicCurve}
+  `;
+
+  // Interior layer timings
+  const interiorTransform = isExiting 
+    ? 'translateY(-6px)' 
+    : (mounted ? 'translateY(0)' : 'translateY(6px)');
+  
+  const interiorTransition = `transform 0.3s ${cubicCurve}, opacity 0.25s ease`;
 
   return (
     <div
       style={{
-        pointerEvents: 'auto',
+        pointerEvents: isExiting ? 'none' : 'auto',
         display: 'flex',
         alignItems: 'center',
-        gap: 12,
-        padding: '10px 14px 10px 16px',
-        borderRadius: 12,
-        background: 'rgba(20, 20, 22, 0.92)',
-        backdropFilter: 'blur(18px)',
-        WebkitBackdropFilter: 'blur(18px)',
-        border: '1px solid rgba(255,255,255,0.08)',
-        boxShadow: '0 8px 28px rgba(0,0,0,0.55), 0 2px 6px rgba(0,0,0,0.35)',
-        color: 'rgba(255,255,255,0.92)',
+        borderRadius: 13,
+        background: 'rgba(20, 20, 22, 0.85)',
+        backdropFilter: 'blur(24px)',
+        WebkitBackdropFilter: 'blur(24px)',
+        border: isExiting ? '1px solid rgba(255,255,255,0)' : '1px solid rgba(255,255,255,0.09)',
+        boxShadow: isExiting ? '0 0px 0px rgba(0,0,0,0)' : '0 12px 36px rgba(0,0,0,0.45), 0 4px 12px rgba(0,0,0,0.25)',
+        color: 'rgba(255,255,255,0.95)',
         fontSize: 12,
         fontWeight: 500,
         lineHeight: 1.4,
-        // Sliding into place. The transform here is added on top of
-        // any parent transform, so we don't break the centering — the
-        // parent uses `translateX(-50%)`, this row only translates Y.
-        transform: mounted ? 'translateY(0)' : 'translateY(8px)',
-        opacity: mounted ? 1 : 0,
-        transition: 'transform 0.18s cubic-bezier(0.2, 0.7, 0.2, 1), opacity 0.18s',
         minWidth: 0,
         maxWidth: '100%',
+        overflow: 'hidden',
+        
+        transformOrigin: 'top center',
+        transition: masterTransition,
+        ...currentStyle
       }}
     >
-      {/* Kind indicator — a 3px vertical strip with the kind colour. */}
+      {/* Kind indicator strip */}
       <div style={{
         width: 3, alignSelf: 'stretch', borderRadius: 999,
         background: stripColor, flexShrink: 0, marginTop: 1, marginBottom: 1,
+        opacity: mounted && !isExiting ? 1 : 0,
+        transform: mounted && !isExiting ? 'scaleY(1)' : 'scaleY(0.1)',
+        transition: `transform 0.3s ${cubicCurve}, opacity 0.2s ease`,
       }} />
-      <div style={{ flex: 1, minWidth: 0 }}>{toast.message}</div>
+
+      {/* Message Text */}
+      <div style={{ 
+        flex: 1, 
+        minWidth: 0,
+        opacity: mounted && !isExiting ? 1 : 0,
+        transform: interiorTransform,
+        transition: interiorTransition
+      }}>
+        {toast.message}
+      </div>
+
+      {/* Action Button */}
       {toast.action ? (
         <button
           type="button"
@@ -215,7 +233,9 @@ function ToastRow({ toast, onDismiss, accent }) {
             cursor: 'pointer',
             flexShrink: 0,
             whiteSpace: 'nowrap',
-            transition: 'background 0.12s, border-color 0.12s',
+            opacity: mounted && !isExiting ? 1 : 0,
+            transform: interiorTransform,
+            transition: `${interiorTransition}, background 0.12s, border-color 0.12s`,
           }}
           onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.1)'; e.currentTarget.style.borderColor = 'rgba(255,255,255,0.22)'; }}
           onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.04)'; e.currentTarget.style.borderColor = 'rgba(255,255,255,0.14)'; }}
@@ -223,9 +243,11 @@ function ToastRow({ toast, onDismiss, accent }) {
           {toast.action.label}
         </button>
       ) : null}
+
+      {/* Dismiss Button */}
       <button
         type="button"
-        onClick={() => onDismiss(toast.id)}
+        onClick={handleDismiss}
         title="Dismiss"
         style={{
           padding: 0,
@@ -237,6 +259,9 @@ function ToastRow({ toast, onDismiss, accent }) {
           cursor: 'pointer',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           flexShrink: 0,
+          opacity: mounted && !isExiting ? 1 : 0,
+          transform: interiorTransform,
+          transition: interiorTransition
         }}
         onMouseEnter={(e) => { e.currentTarget.style.color = '#fff'; }}
         onMouseLeave={(e) => { e.currentTarget.style.color = 'rgba(255,255,255,0.5)'; }}
@@ -245,6 +270,77 @@ function ToastRow({ toast, onDismiss, accent }) {
           <line x1="6" y1="6" x2="18" y2="18" />
           <line x1="18" y1="6" x2="6" y2="18" />
         </svg>
+      </button>
+    </div>
+  );
+}
+
+/**
+ * Standalone Testing Utility UI Component
+ */
+function ToastDebugger({ pushToast }) {
+  const btnStyle = {
+    padding: '6px 10px',
+    borderRadius: '6px',
+    border: '1px solid rgba(255,255,255,0.1)',
+    background: 'rgba(255,255,255,0.05)',
+    color: 'rgba(255,255,255,0.8)',
+    fontSize: '11px',
+    fontWeight: '600',
+    cursor: 'pointer',
+    transition: 'all 0.15s ease',
+  };
+
+  const triggerTest = (type) => {
+    if (type === 'success') {
+      pushToast({
+        message: "Added 'Midnight City' to your queue.",
+        kind: 'success',
+        action: { label: 'Undo', onClick: () => console.log('Undo triggered!') }
+      });
+    } else if (type === 'error') {
+      pushToast({
+        message: 'Failed to update playlist. Connection lost.',
+        kind: 'error',
+        durationMs: 0
+      });
+    } else {
+      pushToast({
+        message: 'Syncing music library with cloud backup...',
+        kind: 'info'
+      });
+    }
+  };
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        bottom: '20px',
+        right: '20px',
+        zIndex: 9999,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '6px',
+        padding: '10px',
+        borderRadius: '12px',
+        background: 'rgba(15, 15, 17, 0.85)',
+        backdropFilter: 'blur(12px)',
+        border: '1px solid rgba(255,255,255,0.06)',
+        boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
+      }}
+    >
+      <div style={{ color: 'rgba(255,255,255,0.4)', fontSize: '9px', fontWeight: '700', letterSpacing: '0.5px', textTransform: 'uppercase', marginBottom: '2px', textAlign: 'center' }}>
+        Toast Engine Lab
+      </div>
+      <button type="button" style={btnStyle} onClick={() => triggerTest('success')} onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(123, 225, 145, 0.15)'} onMouseLeave={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.05)'}>
+        💥 Test Success
+      </button>
+      <button type="button" style={btnStyle} onClick={() => triggerTest('info')} onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.15)'} onMouseLeave={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.05)'}>
+        ✨ Test Info
+      </button>
+      <button type="button" style={btnStyle} onClick={() => triggerTest('error')} onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(243, 114, 114, 0.15)'} onMouseLeave={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.05)'}>
+        🚨 Test Error
       </button>
     </div>
   );
