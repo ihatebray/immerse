@@ -271,6 +271,10 @@ export default function ImmersiveLibraryPage({
   onSetAmbientMode,
   ambientCustomDelaySec = 30,
   onSetAmbientCustomDelaySec,
+  transitionMode = 'off',
+  onSetTransitionMode,
+  crossfadeSec = 6,
+  onSetCrossfadeSec,
   twoPaneEnabled = false,
   onSetTwoPaneEnabled,
   discordPresenceEnabled = false,
@@ -1971,6 +1975,10 @@ export default function ImmersiveLibraryPage({
         onSetAmbientMode={onSetAmbientMode}
         ambientCustomDelaySec={ambientCustomDelaySec}
         onSetAmbientCustomDelaySec={onSetAmbientCustomDelaySec}
+        transitionMode={transitionMode}
+        onSetTransitionMode={onSetTransitionMode}
+        crossfadeSec={crossfadeSec}
+        onSetCrossfadeSec={onSetCrossfadeSec}
         twoPaneEnabled={twoPaneEnabled}
         onSetTwoPaneEnabled={onSetTwoPaneEnabled}
         discordPresenceEnabled={discordPresenceEnabled}
@@ -2591,13 +2599,53 @@ function MetadataEditor({ track, onSave, onClose, accent }) {
             ) : (
               <div style={{
                 fontSize: 11, color: 'rgba(255,255,255,0.5)', lineHeight: 1.5,
-                overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical',
+                display: 'flex', flexDirection: 'column', gap: 3,
               }}>
-                <span style={{ color: 'rgba(255,255,255,0.85)', fontWeight: 600 }}>{track.title || 'Untitled'}</span>
-                <br />
-                <span style={{ fontSize: 10.5 }}>{track.artist || '—'}</span>
-                <br />
-                <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.35)', marginTop: 6, display: 'block' }}>
+                <span style={{
+                  color: 'rgba(255,255,255,0.9)', fontWeight: 700, fontSize: 12.5,
+                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                }}>{track.title || 'Untitled'}</span>
+                <span style={{
+                  fontSize: 11, color: 'rgba(255,255,255,0.7)',
+                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                }}>{track.artist || '—'}</span>
+                {(track.album || track.year) ? (
+                  <span style={{
+                    fontSize: 10.5, color: 'rgba(255,255,255,0.45)',
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  }}>
+                    {[track.album, track.year].filter(Boolean).join(' · ')}
+                  </span>
+                ) : null}
+                {/* Compact fact chips fill the space below — format, length,
+                    track no., and play count, each only when known. These are
+                    read-only context while editing the fields below. */}
+                {(() => {
+                  const fmt = getFileFormatLabel(track.filePath);
+                  const facts = [
+                    fmt || null,
+                    track.duration ? formatTime(track.duration) : null,
+                    track.trackNumber != null && String(track.trackNumber).trim()
+                      ? `Track ${track.trackNumber}` : null,
+                    (Number(track.playCount) || 0) > 0
+                      ? `${track.playCount} play${Number(track.playCount) === 1 ? '' : 's'}` : null,
+                  ].filter(Boolean);
+                  return facts.length ? (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 5 }}>
+                      {facts.map((f, idx) => (
+                        <span key={idx} style={{
+                          padding: '2px 7px', borderRadius: 6,
+                          fontSize: 9.5, fontWeight: 600, letterSpacing: 0.2,
+                          background: 'rgba(255,255,255,0.05)',
+                          border: '1px solid rgba(255,255,255,0.07)',
+                          color: 'rgba(255,255,255,0.5)',
+                          whiteSpace: 'nowrap',
+                        }}>{f}</span>
+                      ))}
+                    </div>
+                  ) : null;
+                })()}
+                <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', marginTop: 5 }}>
                   Click cover to choose an image, drop one in, or paste a URL.
                 </span>
               </div>
@@ -7144,6 +7192,10 @@ function SideDock({
   onSetAmbientMode,
   ambientCustomDelaySec = 30,
   onSetAmbientCustomDelaySec,
+  transitionMode = 'off',
+  onSetTransitionMode,
+  crossfadeSec = 6,
+  onSetCrossfadeSec,
   twoPaneEnabled = false,
   onSetTwoPaneEnabled,
   discordPresenceEnabled = false,
@@ -7546,6 +7598,10 @@ function SideDock({
             onSetAmbientMode={onSetAmbientMode}
             ambientCustomDelaySec={ambientCustomDelaySec}
             onSetAmbientCustomDelaySec={onSetAmbientCustomDelaySec}
+            transitionMode={transitionMode}
+            onSetTransitionMode={onSetTransitionMode}
+            crossfadeSec={crossfadeSec}
+            onSetCrossfadeSec={onSetCrossfadeSec}
             twoPaneEnabled={twoPaneEnabled}
             onSetTwoPaneEnabled={onSetTwoPaneEnabled}
             discordPresenceEnabled={discordPresenceEnabled}
@@ -17311,6 +17367,10 @@ function SettingsTab({
   onSetAmbientMode,
   ambientCustomDelaySec = 30,
   onSetAmbientCustomDelaySec,
+  transitionMode = 'off',
+  onSetTransitionMode,
+  crossfadeSec = 6,
+  onSetCrossfadeSec,
   twoPaneEnabled = false,
   onSetTwoPaneEnabled,
   discordPresenceEnabled = false,
@@ -17789,6 +17849,12 @@ function SettingsTab({
           onSetMode={onSetAmbientMode}
           customDelaySec={ambientCustomDelaySec}
           onSetCustomDelaySec={onSetAmbientCustomDelaySec}
+        />
+        <TransitionSettingRow
+          mode={transitionMode}
+          onSetMode={onSetTransitionMode}
+          crossfadeSec={crossfadeSec}
+          onSetCrossfadeSec={onSetCrossfadeSec}
         />
       </Section>
 
@@ -20622,6 +20688,104 @@ function AmbientSettingRow({ mode, onSetMode, customDelaySec, onSetCustomDelaySe
             }}
           />
           <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.45)' }}>seconds (5–600)</span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * TransitionSettingRow — picks how one track flows into the next.
+ * Visually mirrors AmbientSettingRow: a segmented control plus a contextual
+ * slider that only appears for 'crossfade'.
+ *
+ *   off       → hard cut (original behaviour; small decode gap)
+ *   gapless   → next track preloaded and started ~0.18s before the end;
+ *               no overlap, inaudible seam on lossless files
+ *   crossfade → next track starts `crossfadeSec` early and the two overlap
+ *               while one fades down and the other fades up
+ */
+function TransitionSettingRow({ mode, onSetMode, crossfadeSec, onSetCrossfadeSec }) {
+  const options = [
+    { value: 'off',       label: 'Off' },
+    { value: 'gapless',   label: 'Gapless' },
+    { value: 'crossfade', label: 'Crossfade' },
+  ];
+
+  const description = mode === 'off'
+    ? 'Tracks change with a hard cut — there may be a brief gap as the next file loads.'
+    : mode === 'gapless'
+    ? 'The next track is loaded ahead of time and starts the instant the current one ends — no gap, no overlap.'
+    : `The next track fades in over ${crossfadeSec} second${crossfadeSec === 1 ? '' : 's'} while the current one fades out, so they briefly overlap.`;
+
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column', gap: 10,
+      padding: '12px 11px', borderRadius: 10,
+      background: 'rgba(255,255,255,0.03)',
+      border: '1px solid rgba(255,255,255,0.06)',
+    }}>
+      <div>
+        <div style={{ fontSize: 12, fontWeight: 600, color: 'rgba(255,255,255,0.9)', lineHeight: 1.2 }}>
+          Track transitions
+        </div>
+        <div style={{ fontSize: 10.5, color: 'rgba(255,255,255,0.45)', lineHeight: 1.45, marginTop: 3 }}>
+          {description}
+        </div>
+      </div>
+
+      {/* Segmented control */}
+      <div style={{
+        display: 'flex', gap: 4, padding: 3,
+        background: 'rgba(0,0,0,0.25)', borderRadius: 8,
+      }}>
+        {options.map((opt) => {
+          const active = mode === opt.value;
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              onClick={() => onSetMode?.(opt.value)}
+              style={{
+                flex: 1,
+                padding: '6px 8px',
+                borderRadius: 6,
+                border: 'none',
+                background: active ? 'rgba(255,255,255,0.14)' : 'transparent',
+                color: active ? '#fff' : 'rgba(255,255,255,0.55)',
+                fontSize: 11.5,
+                fontWeight: active ? 600 : 500,
+                cursor: 'pointer',
+                transition: 'background 0.15s, color 0.15s',
+              }}
+            >
+              {opt.label}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Crossfade length — only visible when 'crossfade' is selected. */}
+      {mode === 'crossfade' ? (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <label style={{ fontSize: 11, color: 'rgba(255,255,255,0.65)', flexShrink: 0 }}>
+            Length
+          </label>
+          <input
+            type="range"
+            min={1}
+            max={12}
+            step={1}
+            value={crossfadeSec}
+            onChange={(e) => onSetCrossfadeSec?.(Number(e.target.value))}
+            style={{ flex: 1, accentColor: '#fff', cursor: 'pointer' }}
+          />
+          <span style={{
+            fontSize: 11, color: 'rgba(255,255,255,0.65)',
+            fontVariantNumeric: 'tabular-nums', minWidth: 26, textAlign: 'right',
+          }}>
+            {crossfadeSec}s
+          </span>
         </div>
       ) : null}
     </div>

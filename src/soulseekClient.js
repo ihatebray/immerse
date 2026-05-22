@@ -265,7 +265,15 @@ function containsWord(haystack, needle) {
 }
 
 export function passesJunkFilter(query, filename, folderPath = '') {
-  const haystack = normalizeForCompare(filename) + ' ' + normalizeForCompare(folderPath);
+  // Only inspect the FILENAME and its IMMEDIATE parent folder — not the whole
+  // path hierarchy. A user's share might sit under ".../Live Sets/..." or
+  // ".../Bootlegs/..." or a top folder literally named "Demos"; inspecting
+  // the full path would drop perfectly normal studio files just because some
+  // ancestor folder contains a junk word. The version markers we care about
+  // ("Song (Live).mp3", "Album (Live)/...") live in the file or its own
+  // folder, so the immediate level is enough.
+  const immediateFolder = soulseekBasename(String(folderPath || '').replace(/\\/g, '/'));
+  const haystack = normalizeForCompare(filename) + ' ' + normalizeForCompare(immediateFolder);
   const queryNorm = normalizeForCompare(query);
   for (const word of JUNK_WORDS) {
     if (containsWord(haystack, word)) {
@@ -274,6 +282,139 @@ export function passesJunkFilter(query, filename, folderPath = '') {
     }
   }
   return true;
+}
+
+/* ---------- Match scoring ----------
+ *
+ * The junk filter above is a coarse gate. For auto-import (playlist →
+ * Soulseek) we need to actually rank how well each candidate matches the
+ * *intended* track, not just how high its bitrate is. Otherwise the top
+ * result by quality is often a live cut, a remix, or a different song that
+ * merely shares a word with the query.
+ *
+ * scoreSoulseekMatch returns { score (0..1), reasons[], penalties[] } for a
+ * single candidate against a target {title, artist, durationMs}. It blends:
+ *   - title token overlap   (how many of the title's words are in the file)
+ *   - artist token overlap
+ *   - duration proximity     (within a few seconds of the target length)
+ *   - variant penalties      (live/remix/cover/etc. that the target didn't ask for)
+ */
+
+// Variant markers that usually indicate the WRONG version of a track when
+// the user imported a normal studio track. Separate from JUNK_WORDS so we
+// can weight them and report which one tripped.
+const VARIANT_MARKERS = [
+  'live', 'remix', 'cover', 'instrumental', 'karaoke', 'acoustic',
+  'sped up', 'speed up', 'slowed', 'nightcore', 'demo', 'remaster',
+  'remastered', 're recorded', 're-recorded', 'rerecorded', 'edit',
+  'radio edit', 'extended', 'reverb', '8d', 'mashup', 'bootleg',
+  'session', 'unplugged', 'rehearsal',
+];
+
+// Words too generic to count as meaningful title/artist evidence.
+const STOPWORDS = new Set([
+  'the', 'a', 'an', 'and', 'of', 'to', 'in', 'on', 'feat', 'ft',
+  'featuring', 'with', 'pt', 'part', 'vol',
+]);
+
+function tokenize(s) {
+  return normalizeForCompare(s)
+    .split(/\s+/)
+    .filter((w) => w && !STOPWORDS.has(w));
+}
+
+// Fraction of `needleTokens` present in `hayTokens` (0..1).
+function tokenOverlap(needleTokens, hayTokens) {
+  if (needleTokens.length === 0) return 1; // nothing to match → not penalised
+  const hay = new Set(hayTokens);
+  let hit = 0;
+  for (const t of needleTokens) if (hay.has(t)) hit += 1;
+  return hit / needleTokens.length;
+}
+
+/**
+ * Score one candidate against the intended track.
+ * @param {object} cand   one soulseekSearch result (has filename, folder, duration)
+ * @param {object} target { title, artist, durationMs }
+ * @returns {{score:number, reasons:string[], penalties:string[]}}
+ */
+export function scoreSoulseekMatch(cand, target) {
+  const reasons = [];
+  const penalties = [];
+
+  const fileText = `${normalizeForCompare(cand.filename || '')} ${normalizeForCompare(cand.folder || '')}`;
+  const fileTokens = fileText.split(/\s+/).filter(Boolean);
+
+  const titleTokens = tokenize(target?.title || '');
+  const artistTokens = tokenize(target?.artist || '');
+
+  const titleScore = tokenOverlap(titleTokens, fileTokens);   // 0..1
+  const artistScore = tokenOverlap(artistTokens, fileTokens); // 0..1
+
+  // Duration proximity. Soulseek file durations are in seconds; Spotify
+  // gives ms. If either is missing we neither reward nor punish.
+  let durScore = 0.5; // neutral when unknown
+  const targetSec = target?.durationMs ? target.durationMs / 1000 : 0;
+  const candSec = Number(cand.duration) || 0;
+  if (targetSec > 0 && candSec > 0) {
+    const diff = Math.abs(candSec - targetSec);
+    if (diff <= 2) { durScore = 1; reasons.push('duration matches'); }
+    else if (diff <= 5) durScore = 0.85;
+    else if (diff <= 12) durScore = 0.55;
+    else if (diff <= 30) durScore = 0.25;
+    else { durScore = 0; penalties.push(`duration off by ${Math.round(diff)}s`); }
+  }
+
+  // Variant penalty: a marker in the file that is NOT in the requested
+  // title/artist strongly suggests the wrong version.
+  const targetText = `${normalizeForCompare(target?.title || '')} ${normalizeForCompare(target?.artist || '')}`;
+  let variantPenalty = 0;
+  for (const marker of VARIANT_MARKERS) {
+    if (containsWord(fileText, marker) && !containsWord(targetText, marker)) {
+      variantPenalty += 0.5;
+      penalties.push(`"${marker}" version`);
+    }
+  }
+  if (variantPenalty > 1) variantPenalty = 1;
+
+  if (titleScore >= 0.99) reasons.push('title matches');
+  else if (titleScore >= 0.6) reasons.push('title mostly matches');
+  if (artistScore >= 0.99) reasons.push('artist matches');
+
+  // Weighted blend. Title and artist dominate; duration and variant adjust.
+  // Title 0.45, artist 0.30, duration 0.25, then subtract variant penalty.
+  let score = (titleScore * 0.45) + (artistScore * 0.30) + (durScore * 0.25);
+  score -= variantPenalty * 0.55;
+  if (score < 0) score = 0;
+  if (score > 1) score = 1;
+
+  return { score, reasons, penalties, titleScore, artistScore, durScore, variantPenalty };
+}
+
+/**
+ * Pick the best-matching result from a list for the intended track.
+ * Returns { best, scored, confident } where:
+ *   - scored   : every candidate with its score, sorted best-first
+ *   - best     : the top candidate (or null if list empty)
+ *   - confident: true if `best` cleared the acceptance threshold
+ *
+ * Among candidates of similar match score we still prefer higher quality,
+ * so we add a small quality nudge (bitrate tier / slots) as a tiebreaker.
+ */
+export function pickBestMatch(results, target, { threshold = 0.62 } = {}) {
+  const list = Array.isArray(results) ? results : [];
+  const scored = list.map((r) => {
+    const m = scoreSoulseekMatch(r, target);
+    // Small quality tiebreaker (max +0.04) so a clean studio FLAC edges out
+    // a clean studio 192kbps mp3 without overriding match quality.
+    const tier = bitrateTier(r.ext, r.bitrate); // 0..5
+    const quality = (tier / 5) * 0.03 + (r.slots ? 0.01 : 0);
+    return { ...r, _match: m, _rank: m.score + quality };
+  });
+  scored.sort((a, b) => b._rank - a._rank);
+  const best = scored[0] || null;
+  const confident = !!best && best._match.score >= threshold;
+  return { best, scored, confident };
 }
 
 /* ---------- Search ---------- */
@@ -324,7 +465,7 @@ function bitrateTier(ext, bitrate) {
   return 0;
 }
 
-export async function soulseekSearch(query, { filter = true } = {}) {
+export async function soulseekSearch(query, { filter = true, timeout, debug = false } = {}) {
   const q = String(query || '').trim();
   if (!q) return { results: [], albums: [] };
 
@@ -332,18 +473,31 @@ export async function soulseekSearch(query, { filter = true } = {}) {
 
   let raw;
   try {
-    raw = await c.search(q);
+    // Pass an explicit timeout when given. The library collects peer
+    // responses for the whole window then resolves (it does NOT stop early),
+    // so a longer window catches slower-responding peers that may be the
+    // only ones sharing a rare file.
+    raw = await c.search(q, timeout ? { timeout } : undefined);
   } catch (e) {
     forceDisconnect();
     throw new Error(String(e?.message || e));
   }
   if (!Array.isArray(raw)) raw = [];
 
+  // Diagnostics: count what actually came back vs. what survived filtering,
+  // so we can tell whether "no results" means the network returned nothing
+  // or the junk filter ate everything.
+  let rawPeers = 0;
+  let rawAudioFiles = 0;
+  let droppedByJunk = 0;
+  let droppedNonAudio = 0;
+
   const flat = [];
   for (const group of raw) {
     if (!group || typeof group !== 'object') continue;
     const user = String(group.username || group.user || '').trim();
     if (!user) continue;
+    rawPeers += 1;
     const slots = group.slotsFree != null
       ? !!group.slotsFree
       : (group.hasFreeUploadSlot != null
@@ -355,11 +509,13 @@ export async function soulseekSearch(query, { filter = true } = {}) {
     const filesArr = Array.isArray(group.files) ? group.files : [];
     for (const fRaw of filesArr) {
       const f = pickFileFields(fRaw);
-      if (!f.filename || !isAudioFile(f.filename)) continue;
+      if (!f.filename) continue;
+      if (!isAudioFile(f.filename)) { droppedNonAudio += 1; continue; }
+      rawAudioFiles += 1;
       const filename = soulseekBasename(f.filename);
       const folder = soulseekParentFolder(f.filename);
       const ext = path.extname(filename).slice(1).toLowerCase();
-      if (filter && !passesJunkFilter(q, filename, folder)) continue;
+      if (filter && !passesJunkFilter(q, filename, folder)) { droppedByJunk += 1; continue; }
       flat.push({
         id: `${user}::${f.filename}`,
         user,
@@ -374,6 +530,12 @@ export async function soulseekSearch(query, { filter = true } = {}) {
         speed,
       });
     }
+  }
+
+  if (debug) {
+    console.log(`[slsk-search] "${q}": ${rawPeers} peers responded, ` +
+      `${rawAudioFiles} audio files; dropped ${droppedByJunk} by junk-filter, ` +
+      `${droppedNonAudio} non-audio; ${flat.length} kept`);
   }
 
   const seen = new Set();

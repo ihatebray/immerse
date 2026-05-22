@@ -322,6 +322,45 @@ export default function App() {
   const [seekNonce, setSeekNonce] = useState(0);
   const [shuffleOn, setShuffleOn] = useState(false);
   const [repeat, setRepeat] = useState('off');
+
+  // Track-to-track transition style:
+  //   'off'       — hard cut (the next track's src is loaded only when the
+  //                 previous ends; this is the original behaviour and has a
+  //                 small unavoidable decode gap)
+  //   'gapless'   — next track is preloaded into the standby element during
+  //                 playback and started ~0.18s before the current ends, so
+  //                 the seam is inaudible (no overlap)
+  //   'crossfade' — next track starts `crossfadeSec` early and the two
+  //                 overlap while one gain ramps down and the other up
+  const [transitionMode, setTransitionMode] = useState(() => {
+    if (typeof window === 'undefined') return 'off';
+    const v = window.localStorage.getItem('immerse:transitionMode');
+    if (v === 'off' || v === 'gapless' || v === 'crossfade') return v;
+    return 'off';
+  });
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      try { window.localStorage.setItem('immerse:transitionMode', transitionMode); }
+      catch { /* ignore */ }
+    }
+    transitionModeRef.current = transitionMode;
+  }, [transitionMode]);
+
+  // Crossfade length in seconds. Only meaningful when transitionMode is
+  // 'crossfade'. Bounded 1–12s so a fat-finger can't blend two whole tracks.
+  const [crossfadeSec, setCrossfadeSec] = useState(() => {
+    if (typeof window === 'undefined') return 6;
+    const n = Number(window.localStorage.getItem('immerse:crossfadeSec'));
+    if (Number.isFinite(n) && n >= 1 && n <= 12) return Math.round(n);
+    return 6;
+  });
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      try { window.localStorage.setItem('immerse:crossfadeSec', String(crossfadeSec)); }
+      catch { /* ignore */ }
+    }
+    crossfadeSecRef.current = crossfadeSec;
+  }, [crossfadeSec]);
   // Volume persists across launches. Defaults to 30% on first launch
   // so the app doesn't blast at full volume the first time. After that
   // it remembers whatever the user last set.
@@ -1030,7 +1069,9 @@ export default function App() {
   /** Bumps after saving Spotify creds so Find view re-checks configured state. */
   const [spotifyCredsRefreshKey, setSpotifyCredsRefreshKey] = useState(0);
 
-  const audioRef = useRef(null);
+  const audioRef = useRef(null);            // ALWAYS points at the active element
+  const inactiveAudioRef = useRef(null);    // the standby element (preloads the next track)
+  const firstElementRef = useRef(null);     // stable handle to "element A" so we can tell which crossfade gain is which
   const seekGenerationRef = useRef(0);
   /** When this matches the active queue slot + file, we must not set `audio.src` again or playback restarts from 0. */
   const lastAudioLoadKeyRef = useRef(null);
@@ -1040,7 +1081,38 @@ export default function App() {
   const queueRef = useRef([]);
   queueRef.current = queue;
 
+  /* ---- transition engine bookkeeping ----
+   * preloadedKeyRef  : load-key currently staged in the standby element
+   * handoffArmedRef  : true once a gapless/crossfade handoff has begun for the
+   *                    current track (suppresses the active element's natural
+   *                    'ended' so we don't double-advance)
+   * transitionModeRef: mirror of `transitionMode` state, read inside event
+   *                    handlers/callbacks without forcing a re-bind
+   * crossfadeSecRef  : mirror of `crossfadeSec`, same reason */
+  const preloadedKeyRef = useRef(null);
+  const handoffArmedRef = useRef(false);
+  const transitionModeRef = useRef('off');
+  const crossfadeSecRef = useRef(6);
+
   const currentTrack = currentIndex >= 0 && queue[currentIndex] ? queue[currentIndex] : null;
+
+  // Easter egg: detect "Fireflies" by Owl City. Normalizes title +
+  // artist (lowercase, strip punctuation/parentheticals) so things like
+  // "Fireflies (Remastered)" or "Owl City feat. ..." still match. When
+  // this is true AND the song is playing, a swarm of fireflies drifts
+  // across the whole window — see FirefliesOverlay below.
+  const isFireflies = useMemo(() => {
+    if (!currentTrack) return false;
+    const norm = (s) => String(s || '')
+      .toLowerCase()
+      .replace(/\(.*?\)|\[.*?\]/g, '')
+      .replace(/[^a-z0-9\s]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const title = norm(currentTrack.title);
+    const artist = norm(currentTrack.artist);
+    return title === 'fireflies' && artist.includes('owl city');
+  }, [currentTrack]);
 
   useEffect(() => {
     if (!window.electronAPI?.loadLibrary) {
@@ -1122,12 +1194,23 @@ export default function App() {
   }, [libraryBootstrapped]);
 
   useEffect(() => {
-    audioRef.current = new Audio();
-    audioRef.current.volume = perceptualVolume(volume);
+    // Two elements that ping-pong: one plays while the other preloads the
+    // next track. `audioRef` always points at whichever is currently active,
+    // so every other site in this file that reads audioRef.current keeps
+    // working unchanged.
+    const a = new Audio();
+    const b = new Audio();
+    a.volume = perceptualVolume(volume);
+    b.volume = perceptualVolume(volume);
+    // preload='auto' lets the standby element buffer ahead of the handoff.
+    a.preload = 'auto';
+    b.preload = 'auto';
+    audioRef.current = a;
+    inactiveAudioRef.current = b;
+    firstElementRef.current = a;
     return () => {
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current.src = '';
+      for (const el of [a, b]) {
+        try { el.pause(); el.src = ''; } catch { /* ignore */ }
       }
       // Close the analyser graph if it was ever created. Safe to call even
       // if the context is already closed — close() on a closed context
@@ -1136,6 +1219,7 @@ export default function App() {
         try { audioCtxRef.current.close(); } catch { /* ignore */ }
         audioCtxRef.current = null;
         audioSourceRef.current = null;
+        audioSourceBRef.current = null;
         analyserRef.current = null;
       }
     };
@@ -1156,20 +1240,41 @@ export default function App() {
    */
   const analyserRef = useRef(null);
   const audioCtxRef = useRef(null);
-  const audioSourceRef = useRef(null);
+  const audioSourceRef = useRef(null);      // MediaElementSource for element A
+  const audioSourceBRef = useRef(null);     // MediaElementSource for element B
   /** GainNode in the audio graph used to amplify playback above the OS
-   *  100% cap. Driven by `gainBoost` state below. */
+   *  100% cap. Driven by `gainBoost` state below. Shared stage AFTER the
+   *  per-element crossfade gains, so boost applies to whatever is playing. */
   const gainNodeRef = useRef(null);
+  /** Per-element crossfade gains. During a crossfade one ramps to 0 while the
+   *  other ramps to 1; otherwise both sit at 1. gainARef belongs to element A
+   *  (firstElementRef), gainBRef to element B. */
+  const gainARef = useRef(null);
+  const gainBRef = useRef(null);
 
   const ensureAnalyser = useCallback(() => {
     if (analyserRef.current) return analyserRef.current;
-    const audio = audioRef.current;
-    if (!audio) return null;
+    const audioA = firstElementRef.current || audioRef.current;
+    const audioB = inactiveAudioRef.current;
+    if (!audioA) return null;
     try {
       const Ctx = window.AudioContext || window.webkitAudioContext;
       if (!Ctx) return null;
       const ctx = new Ctx();
-      const source = ctx.createMediaElementSource(audio);
+
+      // Wire one element into a source + its own crossfade gain. Each element
+      // MUST get its own MediaElementSource (the binding is permanent and
+      // can't be undone), so we build both up front here.
+      const wireElement = (el) => {
+        const source = ctx.createMediaElementSource(el);
+        const xfadeGain = ctx.createGain();
+        xfadeGain.gain.value = 1; // full unless a crossfade ramps it
+        source.connect(xfadeGain);
+        return { source, gain: xfadeGain };
+      };
+      const aNodes = wireElement(audioA);
+      const bNodes = audioB ? wireElement(audioB) : null;
+
       const analyser = ctx.createAnalyser();
       // 1024 fftSize → 512 frequency bins; cheap and responsive enough for
       // visual feedback without spending real CPU.
@@ -1180,7 +1285,8 @@ export default function App() {
       // GainNode multiplies the signal. >1.0 amplifies (where the audio
       // element's own .volume cap of 1.0 can't reach). Initial value is
       // applied below from current state; subsequent changes flow in
-      // through the gainBoost effect.
+      // through the gainBoost effect. This is now a SHARED stage that both
+      // elements feed into, so boost applies to whichever one is playing.
       const gainNode = ctx.createGain();
       gainNode.gain.value = 1;
 
@@ -1214,9 +1320,13 @@ export default function App() {
       limiter.attack.value = 0.001;      // 1ms — catches transients
       limiter.release.value = 0.05;      // 50ms — fast recovery
 
-      // Graph: source → gain → compressor → limiter → analyser → destination
+      // Graph:
+      //   A.source → A.xfadeGain ┐
+      //                          ├→ boost gain → compressor → limiter → analyser → destination
+      //   B.source → B.xfadeGain ┘
       // (analyser before destination so visualizers see the boosted signal)
-      source.connect(gainNode);
+      aNodes.gain.connect(gainNode);
+      if (bNodes) bNodes.gain.connect(gainNode);
       gainNode.connect(compressor);
       compressor.connect(limiter);
       limiter.connect(analyser);
@@ -1226,7 +1336,10 @@ export default function App() {
       analyser.connect(ctx.destination);
 
       audioCtxRef.current = ctx;
-      audioSourceRef.current = source;
+      audioSourceRef.current = aNodes.source;
+      audioSourceBRef.current = bNodes ? bNodes.source : null;
+      gainARef.current = aNodes.gain;
+      gainBRef.current = bNodes ? bNodes.gain : null;
       analyserRef.current = analyser;
       gainNodeRef.current = gainNode;
       return analyser;
@@ -1237,6 +1350,11 @@ export default function App() {
       return null;
     }
   }, []);
+
+  /** Returns the crossfade GainNode belonging to the currently-active element. */
+  const activeGainNode = useCallback(() => (
+    audioRef.current === firstElementRef.current ? gainARef.current : gainBRef.current
+  ), []);
 
   /**
    * Apply the current gainBoost value to the live audio graph. We do this
@@ -1272,7 +1390,7 @@ export default function App() {
   // exist before the gainBoost effect can apply its value.
   useEffect(() => {
     if (!isPlaying) return;
-    if (!analyserRef.current && (beatReactive || gainBoost > 1)) {
+    if (!analyserRef.current && (beatReactive || gainBoost > 1 || transitionMode !== 'off')) {
       ensureAnalyser();
       // ensureAnalyser created the gain node with value 1; sync to the
       // user's saved boost immediately so they don't hear a quiet first
@@ -1288,7 +1406,7 @@ export default function App() {
     if (ctx && ctx.state === 'suspended') {
       ctx.resume().catch(() => { /* ignore */ });
     }
-  }, [isPlaying, beatReactive, gainBoost, ensureAnalyser]);
+  }, [isPlaying, beatReactive, gainBoost, transitionMode, ensureAnalyser]);
 
   // Ambient idle-timer. The "idle" definition and delay both come from
   // user settings:
@@ -1336,7 +1454,203 @@ export default function App() {
     setAmbientArmed(false);
   }, []);
 
+  /* =====================================================================
+   *  Transition engine: preload-next + gapless/crossfade handoff.
+   *
+   *  The active element drives `timeupdate`; on each tick maybeStartHandoff
+   *  (a) stages the upcoming track in the standby element ahead of time and
+   *  (b) once we're within the trigger window, promotes the standby element
+   *  to active. For gapless the trigger is ~0.18s before the end and the
+   *  outgoing element is simply stopped; for crossfade the trigger is the
+   *  full crossfade length and the two elements' gains ramp past each other.
+   * ===================================================================== */
+
+  // Same key the load effect uses, so a staged element won't be reloaded.
+  const trackLoadKey = useCallback((t) => (
+    t ? `${t.id}|${String(t.filePath || t.objectUrl || '')}` : null
+  ), []);
+
+  // Resolve a playback src for a track (mirrors the load effect's logic).
+  const srcForTrack = useCallback((t) => {
+    if (!t) return null;
+    if (window.electronAPI?.getPlaybackUrl && t.filePath) {
+      return window.electronAPI.getPlaybackUrl(t.filePath);
+    }
+    return t.objectUrl || null;
+  }, []);
+
+  // What plays after the current track, honoring repeat. Reads queue/index
+  // live so shuffle and reorders are always reflected.
+  const peekNext = useCallback(() => {
+    const q = queueRef.current;
+    if (!q || q.length === 0) return null;
+    if (repeat === 'one') return { track: q[currentIndex], index: currentIndex };
+    let n = currentIndex + 1;
+    if (n >= q.length) {
+      if (repeat === 'all') n = 0;
+      else return null;
+    }
+    return { track: q[n], index: n };
+  }, [currentIndex, repeat]);
+
+  // Stage the next track into the STANDBY element (buffers, does not play).
+  const preloadNext = useCallback(() => {
+    const standby = inactiveAudioRef.current;
+    if (!standby) return;
+    const nxt = peekNext();
+    if (!nxt || !nxt.track) return;
+    const key = trackLoadKey(nxt.track);
+    if (preloadedKeyRef.current === key) return; // already staged
+    const src = srcForTrack(nxt.track);
+    if (!src) return;
+    standby.src = src;
+    try { standby.currentTime = 0; } catch { /* ignore */ }
+    try { standby.load(); } catch { /* ignore */ }
+    preloadedKeyRef.current = key;
+  }, [peekNext, trackLoadKey, srcForTrack]);
+
+  // Reset both crossfade gains to unity and clear any scheduled ramps.
+  const resetCrossfadeGains = useCallback(() => {
+    const ctx = audioCtxRef.current;
+    for (const g of [gainARef.current, gainBRef.current]) {
+      if (!g) continue;
+      try { g.gain.cancelScheduledValues(ctx ? ctx.currentTime : 0); } catch { /* ignore */ }
+      g.gain.value = 1;
+    }
+  }, []);
+
+  // Promote the standby element to active and run the chosen transition.
+  const performHandoff = useCallback((mode) => {
+    const outgoing = audioRef.current;
+    const incoming = inactiveAudioRef.current;
+    if (!incoming || !incoming.src) { handleNextRef.current(); return; }
+    const nxt = peekNext();
+    if (!nxt) return;
+
+    const ctx = audioCtxRef.current;
+    const outGain = activeGainNode();
+    const inGain = (outGain === gainARef.current) ? gainBRef.current : gainARef.current;
+
+    handoffArmedRef.current = true;
+
+    incoming.volume = outgoing.volume; // keep perceptual volume consistent
+
+    // Push the incoming track's progress into the UI. Called at the moment
+    // the incoming element actually becomes the audible one, so the progress
+    // bar flips in sync with what you hear (not early while the outgoing
+    // track's tail is still playing).
+    const syncProgressUI = () => {
+      seekGenerationRef.current += 1;
+      setCurrentTime(0);
+      const seed = (typeof nxt.track.duration === 'number'
+        && nxt.track.duration > 0 && Number.isFinite(nxt.track.duration))
+        ? nxt.track.duration
+        : (Number.isFinite(incoming.duration) && incoming.duration > 0 ? incoming.duration : 0);
+      setDuration(seed);
+    };
+
+    if (mode === 'crossfade' && ctx && outGain && inGain) {
+      // Start the incoming element now; the two overlap for `dur` seconds.
+      const p = incoming.play(); if (p) p.catch(() => {});
+      syncProgressUI(); // incoming is audible immediately in a crossfade
+      const dur = Math.max(1, crossfadeSecRef.current);
+      const now = ctx.currentTime;
+      // Linear ramps past each other. (Linear is gentle enough for music and
+      // avoids the dip a naive equal-power curve can introduce at the seam.)
+      try {
+        outGain.gain.cancelScheduledValues(now);
+        inGain.gain.cancelScheduledValues(now);
+        outGain.gain.setValueAtTime(outGain.gain.value, now);
+        inGain.gain.setValueAtTime(0.0001, now);
+        outGain.gain.linearRampToValueAtTime(0.0001, now + dur);
+        inGain.gain.linearRampToValueAtTime(1.0, now + dur);
+      } catch { /* ignore */ }
+      // After the fade, stop + rewind the outgoing element and restore its
+      // gain so it's clean for its next turn as the standby element.
+      setTimeout(() => {
+        try { outgoing.pause(); outgoing.currentTime = 0; } catch { /* ignore */ }
+        if (outGain) outGain.gain.value = 1;
+      }, dur * 1000 + 150);
+    } else {
+      // Gapless: we were triggered slightly early (so a sparse timeupdate
+      // tick couldn't skip the window). Don't start the incoming element
+      // immediately — that would clip the tail of the outgoing track or
+      // overlap it. Instead schedule the incoming start for the exact moment
+      // the outgoing track ends, and stop the outgoing element then too.
+      if (outGain) outGain.gain.value = 1;
+      if (inGain) inGain.gain.value = 1;
+      const outDur = outgoing.duration;
+      const remainingMs = (Number.isFinite(outDur) && outDur > 0)
+        ? Math.max(0, (outDur - outgoing.currentTime) * 1000)
+        : 0;
+      const startIncoming = () => {
+        const p = incoming.play(); if (p) p.catch(() => {});
+        try { outgoing.pause(); outgoing.currentTime = 0; } catch { /* ignore */ }
+        syncProgressUI(); // flip the progress bar in sync with the audio
+      };
+      if (remainingMs <= 30) startIncoming();
+      else setTimeout(startIncoming, remainingMs);
+    }
+
+    // Swap refs so audioRef.current === the now-playing element.
+    audioRef.current = incoming;
+    inactiveAudioRef.current = outgoing;
+    preloadedKeyRef.current = null;
+
+    // Advance the index WITHOUT letting the load effect re-set src on the
+    // already-playing element: pre-seed its load-key guard.
+    lastAudioLoadKeyRef.current = trackLoadKey(nxt.track);
+
+    setCurrentIndex(nxt.index);
+  }, [peekNext, activeGainNode, trackLoadKey]);
+
+  // Driven by the active element's timeupdate. Decides when to preload and
+  // when to fire the handoff.
+  const maybeStartHandoff = useCallback((el) => {
+    const mode = transitionModeRef.current;
+    if (mode === 'off') return;
+    if (repeat === 'one') return;            // loops via the seek path instead
+    const dur = el.duration;
+    if (!Number.isFinite(dur) || dur <= 0) return;
+    const remaining = dur - el.currentTime;
+
+    // Stage the next track well before we need it.
+    const preloadLead = mode === 'crossfade' ? (crossfadeSecRef.current + 4) : 8;
+    if (remaining <= preloadLead) preloadNext();
+
+    if (handoffArmedRef.current) return;     // handoff already in progress
+
+    // timeupdate only fires ~4×/sec, so `remaining` arrives in ~0.25s steps.
+    // A fixed tiny window (e.g. <=0.18s) is frequently skipped over entirely
+    // — one tick reads 0.30s left, the next reads -0.05 (already ended) — so
+    // the handoff never fires and playback just stops. Instead we trigger as
+    // soon as we're within one tick-interval of the target boundary. For
+    // gapless the boundary is the very end; we use a 0.6s lead (≈2 ticks of
+    // headroom) which is small enough to stay seamless on a preloaded element
+    // but large enough that a tick always lands inside it.
+    const GAPLESS_LEAD = 0.6;
+    const trigger = mode === 'crossfade' ? crossfadeSecRef.current : GAPLESS_LEAD;
+    if (remaining <= trigger) {
+      const standby = inactiveAudioRef.current;
+      // HAVE_CURRENT_DATA(2) is enough to start without a stall.
+      const ready = standby && standby.src && standby.readyState >= 2;
+      if (ready) performHandoff(mode);
+      else preloadNext();                    // not ready; natural 'ended' covers it
+    }
+  }, [repeat, preloadNext, performHandoff]);
+
+  // Keep a ref to maybeStartHandoff so the (mount-once) listener effect can
+  // call the latest version without re-binding listeners.
+  const maybeStartHandoffRef = useRef(null);
+  maybeStartHandoffRef.current = maybeStartHandoff;
+
   const handleNext = useCallback(() => {
+    // Manual navigation cancels any in-flight transition and resets gains so
+    // they don't get stuck mid-ramp; the load effect then hard-cuts normally.
+    handoffArmedRef.current = false;
+    preloadedKeyRef.current = null;
+    resetCrossfadeGains();
+
     if (queue.length === 0) return;
     if (repeat === 'one') {
       audioRef.current.currentTime = 0;
@@ -1349,43 +1663,74 @@ export default function App() {
       else { setIsPlaying(false); return; }
     }
     setCurrentIndex(next);
-  }, [currentIndex, queue, repeat]);
+  }, [currentIndex, queue, repeat, resetCrossfadeGains]);
 
   handleNextRef.current = handleNext;
 
   useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio) return;
+    const els = [audioRef.current, inactiveAudioRef.current].filter(Boolean);
+    if (els.length === 0) return undefined;
 
-    const onTime = () => setCurrentTime(audio.currentTime);
-    const onSeeked = () => setSeekNonce((n) => n + 1);
-    const syncDuration = () => {
-      const d = audio.duration;
-      if (Number.isFinite(d) && d > 0) setDuration(d);
+    // Only the element that is currently active drives UI state. After a
+    // handoff `audioRef.current` points at the other element, so isActive
+    // flips and the formerly-active element's events become inert.
+    const isActive = (el) => el === audioRef.current;
+
+    const bind = (el) => {
+      const onTime = () => {
+        if (!isActive(el)) return;
+        setCurrentTime(el.currentTime);
+        maybeStartHandoffRef.current?.(el);
+      };
+      const onSeeked = () => { if (isActive(el)) setSeekNonce((n) => n + 1); };
+      const syncDuration = () => {
+        if (!isActive(el)) return;
+        const d = el.duration;
+        if (Number.isFinite(d) && d > 0) setDuration(d);
+      };
+      const onDur = () => syncDuration();
+      const onLoadedMeta = () => syncDuration();
+      const onEnded = () => {
+        if (!isActive(el)) {
+          // The outgoing element of a gapless/crossfade handoff ended after
+          // we already swapped to the incoming one. Clear the arm flag so the
+          // NEXT track's natural end isn't mistakenly swallowed.
+          handoffArmedRef.current = false;
+          return;
+        }
+        // Active element ended with no handoff in flight → normal advance.
+        if (handoffArmedRef.current) { handoffArmedRef.current = false; return; }
+        handleNextRef.current();
+      };
+      const onPlay = () => {
+        if (!isActive(el)) return;
+        // Whichever element is now active and playing means any in-flight
+        // handoff has completed; disarm so the natural-end path works again.
+        handoffArmedRef.current = false;
+        setIsPlaying(true);
+      };
+      const onPause = () => { if (isActive(el)) setIsPlaying(false); };
+
+      el.addEventListener('timeupdate', onTime);
+      el.addEventListener('seeked', onSeeked);
+      el.addEventListener('durationchange', onDur);
+      el.addEventListener('loadedmetadata', onLoadedMeta);
+      el.addEventListener('ended', onEnded);
+      el.addEventListener('play', onPlay);
+      el.addEventListener('pause', onPause);
+      return () => {
+        el.removeEventListener('timeupdate', onTime);
+        el.removeEventListener('seeked', onSeeked);
+        el.removeEventListener('durationchange', onDur);
+        el.removeEventListener('loadedmetadata', onLoadedMeta);
+        el.removeEventListener('ended', onEnded);
+        el.removeEventListener('play', onPlay);
+        el.removeEventListener('pause', onPause);
+      };
     };
-    const onDur = () => syncDuration();
-    const onLoadedMeta = () => syncDuration();
-    const onEnded = () => handleNextRef.current();
-    const onPlay = () => setIsPlaying(true);
-    const onPause = () => setIsPlaying(false);
 
-    audio.addEventListener('timeupdate', onTime);
-    audio.addEventListener('seeked', onSeeked);
-    audio.addEventListener('durationchange', onDur);
-    audio.addEventListener('loadedmetadata', onLoadedMeta);
-    audio.addEventListener('ended', onEnded);
-    audio.addEventListener('play', onPlay);
-    audio.addEventListener('pause', onPause);
-
-    return () => {
-      audio.removeEventListener('timeupdate', onTime);
-      audio.removeEventListener('seeked', onSeeked);
-      audio.removeEventListener('durationchange', onDur);
-      audio.removeEventListener('loadedmetadata', onLoadedMeta);
-      audio.removeEventListener('ended', onEnded);
-      audio.removeEventListener('play', onPlay);
-      audio.removeEventListener('pause', onPause);
-    };
+    const cleanups = els.map(bind);
+    return () => cleanups.forEach((fn) => fn());
   }, []);
 
   useEffect(() => {
@@ -1424,7 +1769,11 @@ export default function App() {
     // Intentionally omit `currentTrack.duration`: metadata hydration updates it and must not reload `src` (that restarts playback).
   }, [currentIndex, currentTrack?.id, currentTrack?.filePath, currentTrack?.objectUrl]);
 
-  useEffect(() => { if (audioRef.current) audioRef.current.volume = perceptualVolume(volume); }, [volume]);
+  useEffect(() => {
+    const pv = perceptualVolume(volume);
+    if (audioRef.current) audioRef.current.volume = pv;
+    if (inactiveAudioRef.current) inactiveAudioRef.current.volume = pv;
+  }, [volume]);
 
   const togglePlay = () => {
     if (!currentTrack) {
@@ -1443,6 +1792,10 @@ export default function App() {
   const handlePrev = () => {
     if (queue.length === 0) return;
     if (audioRef.current.currentTime > 3) { audioRef.current.currentTime = 0; return; }
+    // Manual navigation cancels any in-flight transition and resets gains.
+    handoffArmedRef.current = false;
+    preloadedKeyRef.current = null;
+    resetCrossfadeGains();
     let prev = currentIndex - 1;
     if (prev < 0) prev = repeat === 'all' ? queue.length - 1 : 0;
     setCurrentIndex(prev);
@@ -1911,6 +2264,11 @@ export default function App() {
       // Reset playback + library state locally
       const audio = audioRef.current;
       if (audio) { try { audio.pause(); } catch { /* ignore */ } audio.src = ''; }
+      const standby = inactiveAudioRef.current;
+      if (standby) { try { standby.pause(); } catch { /* ignore */ } standby.src = ''; }
+      handoffArmedRef.current = false;
+      preloadedKeyRef.current = null;
+      resetCrossfadeGains();
       setQueue([]);
       setCurrentIndex(-1);
       setIsPlaying(false);
@@ -1922,7 +2280,7 @@ export default function App() {
       setHasEverPlayed(false);
     }
     return result;
-  }, []);
+  }, [resetCrossfadeGains]);
 
   const removeTracksFromLibrary = async (trackIds) => {
     const ids = new Set((trackIds || []).map(String).filter(Boolean));
@@ -2567,6 +2925,10 @@ export default function App() {
         onSetAmbientMode={setAmbientMode}
         ambientCustomDelaySec={ambientCustomDelaySec}
         onSetAmbientCustomDelaySec={setAmbientCustomDelaySec}
+        transitionMode={transitionMode}
+        onSetTransitionMode={setTransitionMode}
+        crossfadeSec={crossfadeSec}
+        onSetCrossfadeSec={setCrossfadeSec}
         twoPaneEnabled={twoPaneEnabled}
         onSetTwoPaneEnabled={setTwoPaneEnabled}
         discordPresenceEnabled={discordPresenceEnabled}
@@ -2731,7 +3093,178 @@ export default function App() {
       {updateHistoryOpen ? (
         <UpdateHistoryOverlay onClose={closeUpdateHistory} />
       ) : null}
+      {/* Easter egg — fireflies drift across the window while "Fireflies"
+          by Owl City plays. Pure decoration; pointer-events disabled so
+          it never blocks the UI. */}
+      <FirefliesOverlay active={isFireflies && isPlaying} />
     </div>
+  );
+}
+
+/**
+ * FirefliesOverlay — full-window swarm of glowing fireflies, shown as an
+ * easter egg while "Fireflies" by Owl City plays.
+ *
+ * Implementation notes:
+ *   - Canvas-based for smooth 60fps particle motion without thrashing
+ *     React. The component only re-renders when `active` flips; all the
+ *     animation happens imperative inside a rAF loop on the canvas.
+ *   - ~32 particles (medium swarm). Each drifts with gentle sinusoidal
+ *     motion, blinks its glow on its own cycle (real fireflies pulse,
+ *     they don't shine steadily), and varies in size/brightness.
+ *   - Additive blending ('lighter') so overlapping glows build up into
+ *     luminous blooms against the dark UI.
+ *   - Fades in over ~1.5s when activated and out when deactivated, so it
+ *     doesn't pop in/out abruptly on track change.
+ *   - pointer-events: none — purely decorative, never blocks clicks.
+ *   - Respects the canvas being unmounted: the rAF loop is cancelled and
+ *     the canvas cleared on cleanup.
+ */
+function FirefliesOverlay({ active }) {
+  const canvasRef = useRef(null);
+  const rafRef = useRef(null);
+  const particlesRef = useRef([]);
+  const globalAlphaRef = useRef(0);   // master fade 0..1
+  const activeRef = useRef(active);
+
+  // Keep the latest `active` readable inside the persistent rAF loop.
+  useEffect(() => { activeRef.current = active; }, [active]);
+
+  // We keep the canvas + loop alive whenever there's ANY visible
+  // firefly alpha — so when `active` turns off, the swarm fades out
+  // gracefully before we tear down. Mount the loop once.
+  const [shouldRender, setShouldRender] = useState(active);
+  useEffect(() => {
+    if (active) setShouldRender(true);
+    // when inactive, shouldRender stays true until fade-out completes
+    // (handled in the loop, which calls setShouldRender(false) at alpha 0)
+  }, [active]);
+
+  useEffect(() => {
+    if (!shouldRender) return undefined;
+    const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+    const ctx = canvas.getContext('2d');
+
+    let width = 0;
+    let height = 0;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+    const resize = () => {
+      width = window.innerWidth;
+      height = window.innerHeight;
+      canvas.width = width * dpr;
+      canvas.height = height * dpr;
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    };
+    resize();
+    window.addEventListener('resize', resize);
+
+    // Spawn the swarm if not already populated.
+    const COUNT = 32;
+    if (particlesRef.current.length === 0) {
+      particlesRef.current = Array.from({ length: COUNT }, () => ({
+        x: Math.random() * width,
+        y: Math.random() * height,
+        // base drift velocity (px/sec), slow and dreamy
+        vx: (Math.random() - 0.5) * 18,
+        vy: (Math.random() - 0.5) * 14 - 4, // slight upward bias
+        // wander offsets so motion isn't perfectly linear
+        wanderPhase: Math.random() * Math.PI * 2,
+        wanderSpeed: 0.4 + Math.random() * 0.6,
+        // blink cycle
+        blinkPhase: Math.random() * Math.PI * 2,
+        blinkSpeed: 0.6 + Math.random() * 1.1,
+        radius: 1.4 + Math.random() * 2.2,
+        baseBrightness: 0.5 + Math.random() * 0.5,
+      }));
+    }
+
+    let last = performance.now();
+    const tick = (now) => {
+      const dt = Math.min(0.05, (now - last) / 1000); // clamp big gaps
+      last = now;
+
+      // Master fade toward target.
+      const target = activeRef.current ? 1 : 0;
+      const fadeSpeed = activeRef.current ? 0.7 : 0.9; // per second
+      globalAlphaRef.current += (target - globalAlphaRef.current) * Math.min(1, fadeSpeed * dt * 4);
+      if (!activeRef.current && globalAlphaRef.current < 0.01) {
+        // Fully faded out — stop and unmount.
+        ctx.clearRect(0, 0, width, height);
+        setShouldRender(false);
+        return;
+      }
+
+      ctx.clearRect(0, 0, width, height);
+      ctx.globalCompositeOperation = 'lighter';
+
+      const g = globalAlphaRef.current;
+      for (const p of particlesRef.current) {
+        // wander
+        p.wanderPhase += p.wanderSpeed * dt;
+        const wob = Math.sin(p.wanderPhase) * 8;
+        p.x += (p.vx + Math.cos(p.wanderPhase) * 6) * dt;
+        p.y += (p.vy + wob * 0.3) * dt;
+
+        // wrap around edges with a margin so they drift back in
+        const m = 30;
+        if (p.x < -m) p.x = width + m;
+        if (p.x > width + m) p.x = -m;
+        if (p.y < -m) p.y = height + m;
+        if (p.y > height + m) p.y = -m;
+
+        // blink
+        p.blinkPhase += p.blinkSpeed * dt;
+        const blink = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(p.blinkPhase));
+        const alpha = g * p.baseBrightness * blink;
+        if (alpha <= 0.01) continue;
+
+        // glow: radial gradient, warm yellow-green
+        const r = p.radius;
+        const glowR = r * 6;
+        const grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, glowR);
+        grad.addColorStop(0, `rgba(200, 255, 130, ${alpha})`);
+        grad.addColorStop(0.25, `rgba(160, 240, 90, ${alpha * 0.5})`);
+        grad.addColorStop(1, 'rgba(140, 220, 70, 0)');
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, glowR, 0, Math.PI * 2);
+        ctx.fill();
+
+        // bright core
+        ctx.fillStyle = `rgba(230, 255, 190, ${alpha})`;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, r * 0.7, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.globalCompositeOperation = 'source-over';
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+
+    return () => {
+      window.removeEventListener('resize', resize);
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+  }, [shouldRender]);
+
+  if (!shouldRender) return null;
+
+  return (
+    <canvas
+      ref={canvasRef}
+      aria-hidden
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: 55, // below toasts (60) and overlays, above the app UI
+        pointerEvents: 'none',
+      }}
+    />
   );
 }
 
