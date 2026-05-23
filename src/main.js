@@ -58,6 +58,8 @@ import {
   setItunesArtistIdForArtist,
   loadCachedReleases,
   upsertArtistReleases,
+  getAlbumLink,
+  setAlbumLink,
 } from './libraryDb.js';
 import { toolsInstalled } from './binPaths.js';
 import {
@@ -100,7 +102,6 @@ import {
   soulseekSearch,
   soulseekDownload,
   soulseekCancelDownload,
-  pickBestMatch,
 } from './soulseekClient.js';
 import { resolveCoverFilePath, mimeForCoverPath } from './coverArtStore.js';
 import * as discordPresence from './discordPresence.js';
@@ -1820,6 +1821,172 @@ ipcMain.handle('spotify:albumTracks', async (event, albumId) => {
   return spotifyGetAlbumTracks(id);
 });
 
+/**
+ * Resolve a LIBRARY album (which only knows its name + artist + the tracks
+ * the user owns) to a Spotify album, and compute which tracks are missing.
+ *
+ * This is the engine behind "show missing tracks" for existing libraries.
+ * Because library tracks don't store a Spotify album ID, we search Spotify by
+ * "artist album" and SCORE each candidate edition by how well its official
+ * tracklist matches what the user actually owns — the same scoring philosophy
+ * used for Soulseek matching. The best edition wins, but we return the other
+ * candidates too so the UI can offer a confirm/correct step (deluxe vs.
+ * standard, etc.).
+ *
+ * params: { album, artist, ownedTitles: string[], albumId?: string }
+ *   - if albumId is supplied (a previously-confirmed match), we skip search
+ *     and use it directly.
+ * returns: {
+ *   ok, resolved: { albumId, name, artists, albumArtUrl, totalTracks, releaseDate },
+ *   confidence: 0..1, alternatives: [ {albumId,name,totalTracks,releaseDate,score} ],
+ *   tracks: [ official tracks ], missing: [ official tracks not owned ],
+ *   error?
+ * }
+ */
+ipcMain.handle('album:resolveMissing', async (event, params = {}) => {
+  const album = String(params.album || '').trim();
+  const artist = String(params.artist || '').trim();
+  const ownedTitles = Array.isArray(params.ownedTitles) ? params.ownedTitles : [];
+  const forcedId = String(params.albumId || '').trim();
+
+  if (!album) return { ok: false, error: 'No album name.' };
+
+  // Normalize a title for comparison: lowercase, strip parentheticals and
+  // punctuation, collapse whitespace. Mirrors the Soulseek matcher's approach.
+  const norm = (s) => String(s || '')
+    .toLowerCase()
+    .replace(/\([^)]*\)|\[[^\]]*\]/g, ' ')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const ownedNorm = new Set(ownedTitles.map(norm).filter(Boolean));
+
+  // Score one candidate album's official tracklist against what's owned:
+  // overlap = fraction of owned titles found in the official list; plus a
+  // small reward for the official count being >= owned count (a real album
+  // should contain at least what you have) and a penalty for wild count
+  // mismatch (guards against matching a giant compilation).
+  const scoreEdition = (officialTracks) => {
+    const offNorm = officialTracks.map((t) => norm(t.title));
+    const offSet = new Set(offNorm);
+    let hit = 0;
+    for (const o of ownedNorm) if (offSet.has(o)) hit += 1;
+    const overlap = ownedNorm.size ? hit / ownedNorm.size : 0;
+    const offCount = officialTracks.length || 1;
+    const ownedCount = ownedNorm.size || 1;
+    // Count-fit: best when official >= owned and not absurdly larger.
+    let countFit;
+    if (offCount >= ownedCount) {
+      const ratio = ownedCount / offCount; // 1 when equal, →0 as official balloons
+      countFit = 0.4 + 0.6 * ratio;        // never below 0.4 if it's a superset
+    } else {
+      countFit = offCount / ownedCount;    // official smaller than owned = suspicious
+    }
+    return { score: overlap * 0.8 + countFit * 0.2, overlap, offCount };
+  };
+
+  try {
+    let candidates;
+    let usedStoredLink = false;
+    let storedConfirmed = false;
+    // 1) An explicitly-passed albumId (user just picked one) wins.
+    // 2) Otherwise, a previously-stored link for this album short-circuits the
+    //    fuzzy search — exact and instant. A *confirmed* link is authoritative;
+    //    an auto-resolved one is still used but can be re-evaluated.
+    if (forcedId) {
+      candidates = [{ albumId: forcedId }];
+    } else {
+      const link = await getAlbumLink(album, artist).catch(() => null);
+      if (link?.spotifyAlbumId) {
+        candidates = [{ albumId: link.spotifyAlbumId }];
+        usedStoredLink = true;
+        storedConfirmed = !!link.confirmed;
+      } else {
+        const found = await spotifySearchAlbums(`${artist} ${album}`.trim());
+        // Keep the top handful to score; fetching every edition's tracklist is
+        // a network call each, so cap it.
+        candidates = (Array.isArray(found) ? found : []).slice(0, 6);
+        if (candidates.length === 0) {
+          return { ok: false, error: 'No matching album found on Spotify.' };
+        }
+      }
+    }
+
+    // Fetch + score each candidate edition.
+    const scored = [];
+    for (const c of candidates) {
+      let detail;
+      try {
+        detail = await spotifyGetAlbumTracks(c.albumId);
+      } catch {
+        continue;
+      }
+      const s = scoreEdition(detail.tracks || []);
+      scored.push({
+        albumId: c.albumId,
+        name: detail.album || c.name || album,
+        artists: detail.artists || c.artists || artist,
+        albumArtUrl: detail.albumArtUrl || c.albumArtUrl || '',
+        totalTracks: (detail.tracks || []).length,
+        releaseDate: c.releaseDate || '',
+        tracks: detail.tracks || [],
+        ...s,
+      });
+    }
+
+    if (scored.length === 0) {
+      return { ok: false, error: 'Could not load any album tracklist from Spotify.' };
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+    const best = scored[0];
+
+    // Compute missing tracks: official tracks whose normalized title the user
+    // doesn't already own.
+    const missing = best.tracks.filter((t) => !ownedNorm.has(norm(t.title)));
+
+    return {
+      ok: true,
+      resolved: {
+        albumId: best.albumId, name: best.name, artists: best.artists,
+        albumArtUrl: best.albumArtUrl, totalTracks: best.totalTracks,
+        releaseDate: best.releaseDate,
+      },
+      confidence: Math.round(best.score * 100) / 100,
+      // confirmed: the user previously locked this edition in, so the UI can
+      // skip the "is this right?" prompt. fromStoredLink: resolved via a saved
+      // link (confirmed or auto) rather than a fresh search.
+      confirmed: storedConfirmed,
+      fromStoredLink: usedStoredLink,
+      alternatives: scored.slice(0, 5).map((s) => ({
+        albumId: s.albumId, name: s.name, artists: s.artists,
+        totalTracks: s.totalTracks, releaseDate: s.releaseDate,
+        score: Math.round(s.score * 100) / 100,
+      })),
+      tracks: best.tracks,
+      missing,
+    };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
+/**
+ * Persist the user's chosen Spotify edition for a library album (the
+ * confirm/correct step). Once saved with confirmed=true, album:resolveMissing
+ * will use it directly forever instead of re-guessing.
+ * params: { album, artist, albumId, confirmed }
+ */
+ipcMain.handle('album:confirmLink', async (event, params = {}) => {
+  const album = String(params.album || '').trim();
+  const artist = String(params.artist || '').trim();
+  const albumId = String(params.albumId || '').trim();
+  const confirmed = params.confirmed !== false; // default true
+  if (!album || !albumId) return { ok: false, error: 'album and albumId required.' };
+  return setAlbumLink(album, artist, albumId, confirmed);
+});
+
 // Session-scoped caches for Spotify enrichment lookups. When the user
 // imports a whole album (or re-runs an album sync), every track shares
 // the same album metadata and most share the same primary artist —
@@ -2921,9 +3088,6 @@ ipcMain.handle('playlist:importBatch', async (event, params = {}) => {
   const failed = [];
   const skipped = [];
 
-  console.log(`[import-slsk] === batch start: ${tracks.length} track(s), source=${source} ===`);
-  const batchT0 = Date.now();
-
   for (let i = 0; i < tracks.length; i++) {
     const t = tracks[i];
     if (t.skip) {
@@ -2935,251 +3099,23 @@ ipcMain.handle('playlist:importBatch', async (event, params = {}) => {
 
     try {
       if (source === 'soulseek') {
-        // Soulseek path: search, SCORE every candidate against the intended
-        // track (title/artist/duration + live/remix penalties), and take the
-        // best confident match — not just the highest-bitrate result, which
-        // is often a live cut or the wrong song.
-        //
-        // We try progressively looser queries so a track that the first
-        // phrasing misses still gets a chance (this is what a human does
-        // manually). Results from all attempts are pooled and scored together.
-
-        // Scoped console logger for the dev terminal. Every line is prefixed
-        // with [import-slsk] and the track position so a playlist import reads
-        // as a clear play-by-play. Filter your terminal with `import-slsk` to
-        // see only this flow.
-        const tag = `[import-slsk ${i + 1}/${tracks.length}]`;
-        const slog = (...a) => { try { console.log(tag, ...a); } catch { /* ignore */ } };
-
-        const target = {
-          title: t.title || '',
-          artist: t.artists || '',
-          durationMs: Number(t.durationMs) || 0,
-        };
-        slog(`> "${target.title}" - ${target.artist}` +
-          (t.album ? ` [${t.album}]` : '') +
-          (target.durationMs ? ` (${Math.round(target.durationMs / 1000)}s)` : ''));
-
-        // Strip parenthetical/bracketed junk (e.g. "(feat. X)", "(Remastered
-        // 2011)") for a cleaner fallback query — these often don't appear in
-        // shared filenames and cause the strict query to return nothing.
-        const titleClean = String(t.title || '')
-          .replace(/[\(\[].*?[\)\]]/g, ' ')
-          .replace(/\s+/g, ' ')
-          .trim();
-        const primaryArtist = String(t.artists || '').split(/[,&]/)[0].trim();
-        // Album name, similarly cleaned (e.g. drop "(Deluxe Edition)").
-        const albumClean = String(t.album || '')
-          .replace(/[\(\[].*?[\)\]]/g, ' ')
-          .replace(/\s+/g, ' ')
-          .trim();
-
-        const queries = [];
-        const albumTierQueries = new Set();
-        const pushQ = (s, isAlbum = false) => {
-          const v = String(s || '').trim().replace(/\s+/g, ' ');
-          if (v && !queries.includes(v)) {
-            queries.push(v);
-            if (isAlbum) albumTierQueries.add(v);
-          }
-        };
-        // Searches, in order (each only runs if the previous didn't already
-        // find a confident match — see the early-exit in the loop below):
-        //   1. artist + title  — most precise (case/word-order don't matter)
-        //   2. title alone      — broader net; catches files where the peer
-        //      mis-tagged or omitted the artist. The scorer's artist-token
-        //      requirement still filters out wrong-artist songs, so a generic
-        //      title returning noise just won't produce a confident match.
-        //   3. album name alone — catches tracks peers don't tag with artist
-        //      at all; the file lives inside the album folder, which the
-        //      scorer reads.
-        pushQ(`${primaryArtist} ${titleClean}`);
-        if (titleClean) {
-          pushQ(titleClean);
-        }
-        if (albumClean) {
-          pushQ(albumClean, true);
-        }
-
-        slog(`queries (${queries.length}):`, queries.map((q) => `"${q}"`).join('  '));
-
-        const pool = [];
-        const seen = new Set();
-        let searchErr = null;
-        let anyRawResults = false;
-        const addCandidate = (r) => {
-          if (!r || !r.id || seen.has(r.id)) return;
-          seen.add(r.id);
-          pool.push(r);
-        };
-        for (let qi = 0; qi < queries.length; qi++) {
-          const q = queries[qi];
-          const isAlbumTier = albumTierQueries.has(q);
-          slog(`  search [${qi + 1}/${queries.length}]${isAlbumTier ? ' (album)' : ''}: "${q}" ...`);
-          let searchRes;
-          const t0 = Date.now();
-          try {
-            searchRes = await soulseekSearch(q, { filter: true, timeout: 15_000, debug: true });
-          } catch (e) {
-            searchErr = String(e?.message || e);
-            slog(`    x search error: ${searchErr}`);
-            continue;
-          }
-          const rs = Array.isArray(searchRes?.results) ? searchRes.results : [];
-          const albs = Array.isArray(searchRes?.albums) ? searchRes.albums : [];
-          if (rs.length || albs.length) anyRawResults = true;
-          const before = pool.length;
-          // Flat track results (top-10 by quality).
-          for (const r of rs) addCandidate(r);
-          // CRITICAL: also fold in every track INSIDE each returned album
-          // folder. soulseekSearch caps `results` at the 10 highest-quality
-          // files across ALL responses, which for an album-name search are
-          // usually the wrong tracks — the file we actually want lives inside
-          // an album's `tracks` array, not in the flat top-10. Pulling these
-          // in is what lets the album fallback actually find the song.
-          let albTrackCount = 0;
-          for (const alb of albs) {
-            const at = Array.isArray(alb?.tracks) ? alb.tracks : [];
-            albTrackCount += at.length;
-            for (const r of at) addCandidate(r);
-          }
-          const added = pool.length - before;
-          slog(`    -> ${rs.length} track result${rs.length === 1 ? '' : 's'}, ` +
-            `${albs.length} album${albs.length === 1 ? '' : 's'} (${albTrackCount} folder tracks); ` +
-            `+${added} new -> pool ${pool.length}  [${Date.now() - t0}ms]`);
-          // Once we have a confident match we can stop early to save time.
-          const probe = pickBestMatch(pool, target);
-          if (probe.confident) {
-            slog(`    OK confident match found - stopping early ` +
-              `(${probe.best.filename} @ ${Math.round(probe.best._match.score * 100)}%)`);
-            break;
-          }
-        }
-
-        const { best, scored, confident } = pickBestMatch(pool, target);
-
-        // Log the top of the ranking so it's clear WHAT was considered and
-        // why the winner won (or why nothing cleared the bar).
-        if (scored.length) {
-          slog(`pool ${pool.length} files; top candidates:`);
-          for (const r of scored.slice(0, 5)) {
-            const m = r._match;
-            const note = m.penalties.length ? `  [!] ${m.penalties.join(', ')}`
-              : (m.reasons.length ? `  (${m.reasons.join(', ')})` : '');
-            slog(`    ${String(Math.round(m.score * 100)).padStart(3)}%  ${r.filename}${note}`);
-          }
-        }
-
-        // Build a specific failure reason + candidate list for the picker.
-        if (!best || !confident) {
-          let reason;
-          let candidates = [];
-          if (searchErr && pool.length === 0) {
-            reason = `Soulseek search error: ${searchErr}`;
-          } else if (!anyRawResults || pool.length === 0) {
-            reason = albumClean
-              ? `No Soulseek results for the track or its album ("${albumClean}") — no peer appears to be sharing it.`
-              : 'No Soulseek results — no peer is sharing this track (or all were filtered out as junk).';
-          } else {
-            // We found files but none cleared the confidence bar. Explain
-            // WHY the top candidate was rejected so it's actionable.
-            const m = best._match;
-            const pct = Math.round(m.score * 100);
-            const bits = [];
-            if (m.titleScore < 0.6) bits.push('title doesn’t match');
-            if (m.artistScore < 0.6) bits.push('artist doesn’t match');
-            if (m.penalties.length) bits.push(`looks like a ${m.penalties.join(' / ')}`);
-            const why = bits.length ? bits.join('; ') : 'low overall similarity';
-            reason = `No confident match (best ${pct}%: ${why}). ${pool.length} file${pool.length === 1 ? '' : 's'} found — pick one manually if you want it.`;
-            // Hand the top few to the manual picker.
-            candidates = scored.slice(0, 8).map((r) => ({
-              user: r.user,
-              filePath: r.filePath,
-              filename: r.filename,
-              folder: r.folder,
-              ext: r.ext,
-              size: r.size,
-              bitrate: r.bitrate,
-              duration: r.duration,
-              slots: r.slots,
-              matchScore: Math.round(r._match.score * 100),
-              matchNote: r._match.penalties.length
-                ? r._match.penalties.join(', ')
-                : (r._match.reasons.join(', ') || ''),
-            }));
-          }
-          failed.push({ spotifyId: t.spotifyId, error: reason });
-          slog(`x FAILED: ${reason}` + (candidates.length ? `  (${candidates.length} candidates offered to picker)` : ''));
-          emitPlaylistProgress({
-            spotifyId: t.spotifyId, state: 'failed', error: reason,
-            index: i, total: tracks.length,
-            candidates,
-            meta: { title: target.title, artist: target.artist, durationMs: target.durationMs },
-          });
+        // Soulseek path: search for "artist title", take the best
+        // result, download via the existing soulseekDownload helper.
+        // We can't reuse the IPC handler directly (would re-emit
+        // soulseek progress events into the renderer), so we use the
+        // underlying function.
+        const q = `${t.artists} ${t.title}`.trim();
+        const searchRes = await soulseekSearch(q, { filter: true });
+        const best = Array.isArray(searchRes?.results) ? searchRes.results[0] : null;
+        if (!best) {
+          failed.push({ spotifyId: t.spotifyId, error: 'No Soulseek match found.' });
+          emitPlaylistProgress({ spotifyId: t.spotifyId, state: 'failed', error: 'No Soulseek match', index: i, total: tracks.length });
           continue;
         }
-
         const outDir = path.join(app.getPath('userData'), 'streaming-imports');
-        let downloadedPath = null;
-        let lastDlErr = null;
-
-        // Build the list of download attempts: the best match plus other
-        // strong candidates as fallbacks. Peers stall, go offline, or queue
-        // us constantly on Soulseek, so giving up after one is the #1 cause
-        // of "I could find it manually but the import failed." We try every
-        // candidate that's a genuinely good match (within 18% of the best,
-        // and at least the confidence threshold) before declaring failure.
-        const bestPct = best._match.score;
-        const attempts = scored.filter((r) => (
-          r._match.score >= 0.62 && (bestPct - r._match.score) <= 0.18
-        )).slice(0, 5);
-        // Always include `best` even if the band filtering somehow dropped it.
-        if (!attempts.includes(best)) attempts.unshift(best);
-
-        slog(`-> MATCH ${Math.round(bestPct * 100)}%: ${best.filename} ` +
-          `(${best.ext || '?'}${best.bitrate ? ` ${best.bitrate}kbps` : ''}, ` +
-          `${best.size ? (best.size / 1048576).toFixed(1) + 'MB' : '?'}). ` +
-          `${attempts.length} download candidate(s).`);
-
-        for (let ai = 0; ai < attempts.length; ai++) {
-          const cand = attempts[ai];
-          slog(`  download [${ai + 1}/${attempts.length}] from ${cand.user}: ${cand.filename} ...`);
-          const dl0 = Date.now();
-          try {
-            downloadedPath = await soulseekDownload({
-              user: cand.user, filePath: cand.filePath, size: cand.size, outDir,
-              // Shorter idle window so a dead peer is abandoned quickly and we
-              // move to the next candidate instead of burning a full minute.
-              idleTimeoutMs: 25_000,
-            });
-            slog(`  OK downloaded in ${((Date.now() - dl0) / 1000).toFixed(1)}s -> ${downloadedPath}`);
-            break;
-          } catch (e) {
-            lastDlErr = String(e?.message || e);
-            slog(`  x peer failed (${cand.user}): ${lastDlErr}` +
-              (ai < attempts.length - 1 ? ' - trying next candidate' : ''));
-          }
-        }
-
-        if (!downloadedPath) {
-          // Every good candidate failed to download. Offer the full scored
-          // list to the manual picker so the user can try one by hand.
-          const dlErr = `Match found (${Math.round(bestPct * 100)}%) but all ${attempts.length} download attempt(s) failed. Last error: ${lastDlErr || 'unknown'}`;
-          slog(`x FAILED: ${dlErr}`);
-          const candidates = scored.slice(0, 8).map((r) => ({
-            user: r.user, filePath: r.filePath, filename: r.filename, folder: r.folder,
-            ext: r.ext, size: r.size, bitrate: r.bitrate, duration: r.duration, slots: r.slots,
-            matchScore: Math.round(r._match.score * 100),
-            matchNote: r._match.penalties.length ? r._match.penalties.join(', ') : (r._match.reasons.join(', ') || ''),
-          }));
-          failed.push({ spotifyId: t.spotifyId, error: dlErr });
-          emitPlaylistProgress({
-            spotifyId: t.spotifyId, state: 'failed', error: dlErr,
-            index: i, total: tracks.length, candidates,
-            meta: { title: target.title, artist: target.artist, durationMs: target.durationMs },
-          });
-          continue;
-        }
+        const downloadedPath = await soulseekDownload({
+          user: best.user, filePath: best.filePath, size: best.size, outDir,
+        });
         const parsed = await parseAudioFileToTrack(downloadedPath);
         const duration = typeof parsed.duration === 'number' && parsed.duration > 0 ? parsed.duration : 0;
         let coverStored = null;
@@ -3221,12 +3157,10 @@ ipcMain.handle('playlist:importBatch', async (event, params = {}) => {
         const res = await upsertTracks([track]);
         if (!res.ok) {
           failed.push({ spotifyId: t.spotifyId, error: res.error || 'Could not save.' });
-          slog(`x save to library failed: ${res.error || 'unknown'}`);
           emitPlaylistProgress({ spotifyId: t.spotifyId, state: 'failed', error: res.error, index: i, total: tracks.length });
           continue;
         }
         completed.push(track);
-        slog(`DONE - added to library`);
         emitPlaylistProgress({ spotifyId: t.spotifyId, state: 'done', track, index: i, total: tracks.length });
       } else {
         // yt-dlp path: invoke the existing import:fromSpotifyYoutube
@@ -3345,13 +3279,6 @@ ipcMain.handle('playlist:importBatch', async (event, params = {}) => {
       failed.push({ spotifyId: t.spotifyId, error: msg });
       emitPlaylistProgress({ spotifyId: t.spotifyId, state: 'failed', error: msg, index: i, total: tracks.length });
     }
-  }
-
-  console.log(`[import-slsk] === batch done in ${((Date.now() - batchT0) / 1000).toFixed(1)}s: ` +
-    `${completed.length} imported, ${failed.length} failed, ${skipped.length} skipped ===`);
-  if (failed.length) {
-    console.log('[import-slsk] failures:');
-    for (const f of failed) console.log(`[import-slsk]   x ${f.spotifyId}: ${f.error}`);
   }
 
   return {

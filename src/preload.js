@@ -45,6 +45,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   spotifySearch: (query) => ipcRenderer.invoke('spotify:search', query),
   spotifySearchAlbums: (query) => ipcRenderer.invoke('spotify:searchAlbums', query),
   spotifyGetAlbumTracks: (albumId) => ipcRenderer.invoke('spotify:albumTracks', albumId),
+  albumResolveMissing: (params) => ipcRenderer.invoke('album:resolveMissing', params),
+  albumConfirmLink: (params) => ipcRenderer.invoke('album:confirmLink', params),
   // Spotify user OAuth (PKCE). Used for reading playlist contents,
   // which client-credentials apps can't do as of Nov 2024.
   spotifyBeginUserAuth: () => ipcRenderer.invoke('spotify:beginUserAuth'),

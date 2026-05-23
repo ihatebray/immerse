@@ -2148,19 +2148,26 @@ export default function ImmersiveLibraryPage({
           artist={focusTrack?.artist}
           album={focusTrack?.album}
           accent={accent}
+          isPlaying={isPlaying}
+          currentTime={currentTime}
+          duration={duration}
+          shuffleOn={shuffleOn}
+          repeat={repeat}
+          onTogglePlay={onTogglePlay}
+          onPrev={onPrev}
+          onNext={onNext}
+          onSeek={onSeek}
+          onToggleShuffle={onToggleShuffle}
+          onToggleRepeat={onToggleRepeat}
+          lyricsData={lyricsData}
+          hasSyncedLyrics={hasSyncedLyrics}
+          hasPlainLyrics={hasPlainLyrics}
           onClose={() => setCoverFullscreenOpen(false)}
         />
       ) : null}
 
-      {/* Lyric share overlay — opens when the user picks lyrics and taps
-          Share. Renders a beautifully-composed share card (cover art,
-          selected lines, immerse wordmark) and provides Copy text, Copy
-          image, Save image actions. Same z-index layer as the cover
-          fullscreen overlay; both can't logically be open at once. */}
+      {/* Lyric share overlay — preview card + Share with friends (copies image). */}
       {lyricShareOpen && currentTrack && lyricsSelection ? (() => {
-        // Slice the appropriate line buffer based on which lyrics view is
-        // active. Synced lyrics use the {time,text} array; plain lyrics
-        // use the raw newline-split text array.
         let pickedLines = [];
         if (hasSyncedLyrics) {
           pickedLines = (lyricsData?.synced || [])
@@ -3163,10 +3170,42 @@ function AlbumMetadataEditor({ scope, onSave, onClose, accent }) {
             ) : (
               <div style={{
                 fontSize: 11, color: 'rgba(255,255,255,0.5)', lineHeight: 1.5,
+                display: 'flex', flexDirection: 'column', gap: 4,
               }}>
-                <span style={{ color: 'rgba(255,255,255,0.85)', fontWeight: 600 }}>Applies to {scopeText}</span>
-                <br />
-                <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.35)', marginTop: 6, display: 'block' }}>
+                <span style={{ color: 'rgba(255,255,255,0.9)', fontWeight: 600, fontSize: 12 }}>
+                  Applies to {scopeText}
+                </span>
+                {initArtist ? (
+                  <span style={{
+                    fontSize: 11, color: 'rgba(255,255,255,0.6)',
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  }}>{initArtist}</span>
+                ) : null}
+                {/* Read-only context chips fill the space — current album facts.
+                    Each only shows when known. */}
+                {(() => {
+                  const fmt = getFileFormatLabel(sampleTrack?.filePath);
+                  const facts = [
+                    initYear || null,
+                    (initGenre || '').trim() || null,
+                    fmt || null,
+                    `${trackIds.length} track${trackIds.length === 1 ? '' : 's'}`,
+                  ].filter(Boolean);
+                  return facts.length ? (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 4 }}>
+                      {facts.map((f, idx) => (
+                        <span key={idx} style={{
+                          padding: '2px 8px', borderRadius: 6,
+                          fontSize: 9.5, fontWeight: 600, letterSpacing: 0.2,
+                          background: 'rgba(255,255,255,0.05)',
+                          border: '1px solid rgba(255,255,255,0.07)',
+                          color: 'rgba(255,255,255,0.5)', whiteSpace: 'nowrap',
+                        }}>{f}</span>
+                      ))}
+                    </div>
+                  ) : null;
+                })()}
+                <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.32)', marginTop: 4 }}>
                   All tracks in this {discNumber != null ? 'disc' : 'album'} will get these values.
                 </span>
               </div>
@@ -3439,169 +3478,218 @@ function RevaSecondaryBtn({ children, onClick, title, active }) {
  */
 
 /* =========================================================================
- *  CoverFullscreenOverlay — edge-to-edge cover art with a soft blurred
- *  backdrop sampled from the same image. Press Escape, click the close
- *  affordance, or click outside the cover to dismiss.
+ *  CoverFullscreenOverlay — full "now playing" screen. Large cover art with
+ *  a blurred backdrop sampled from the same image, plus the full Immerse
+ *  transport (shuffle / prev / play-pause / next / repeat), a seek bar, and
+ *  track info. Reuses the same Reva controls + HeartSlider as the dock so it
+ *  feels native to the app rather than a separate surface.
  *
- *  Pure read-only display: no playback controls. The dock and progress are
- *  still reachable via keyboard shortcuts (Space, arrows) which the rest
- *  of the app already wires up; cluttering the fullscreen view with a
- *  duplicate control surface would defeat the point of the mode.
+ *  Layout: side-by-side (cover left, controls right) on wide windows; stacks
+ *  vertically when the window is narrow. The dismiss control lives top-LEFT
+ *  to avoid colliding with the OS window buttons on the right, and the top
+ *  strip is window-draggable so the app can still be moved while open.
+ *
+ *  Dismiss: the close button, Escape, or 'f'. Clicking the backdrop also
+ *  closes; clicking the cover or controls does not.
  * ========================================================================= */
-function CoverFullscreenOverlay({ coverUrl, title, artist, album, accent, onClose }) {
-  // Trap-on-mount focus so Escape works immediately and the keyboard reader
-  // announces the overlay.
+function CoverFullscreenOverlay({
+  coverUrl, title, artist, album, accent,
+  isPlaying = false, currentTime = 0, duration = 0,
+  shuffleOn = false, repeat = 'off',
+  onTogglePlay, onPrev, onNext, onSeek, onToggleShuffle, onToggleRepeat,
+  lyricsData = null, hasSyncedLyrics = false, hasPlainLyrics = false,
+  onClose,
+}) {
   const dialogRef = useRef(null);
-  useEffect(() => {
-    dialogRef.current?.focus();
-  }, []);
+  useEffect(() => { dialogRef.current?.focus(); }, []);
 
-  return (
-    <div
-      ref={dialogRef}
-      role="dialog"
-      aria-modal="true"
-      aria-label={`${title || 'Cover art'} — fullscreen`}
-      tabIndex={-1}
-      onClick={onClose}
-      style={{
-        position: 'fixed', inset: 0, zIndex: 50,
-        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-        padding: '4vmin',
-        background: '#000',
-        cursor: 'zoom-out',
-        animation: 'immerseFullscreenIn 220ms ease-out',
-        outline: 'none',
-      }}
-    >
-      <style>{`
-        @keyframes immerseFullscreenIn {
-          0%   { opacity: 0; }
-          100% { opacity: 1; }
-        }
-        @keyframes immerseFullscreenCoverIn {
-          0%   { opacity: 0; transform: scale(0.96); }
-          100% { opacity: 1; transform: scale(1); }
-        }
-      `}</style>
+  const hasAnyLyrics = hasSyncedLyrics || hasPlainLyrics;
 
-      {/* Blurred backdrop — same cover, scaled up huge and saturated, so the
-          background colour shifts with the artwork. */}
-      {coverUrl ? (
-        <div
-          aria-hidden
-          style={{
-            position: 'absolute', inset: -80,
-            backgroundImage: `url(${coverUrl})`,
-            backgroundSize: 'cover', backgroundPosition: 'center',
-            filter: 'blur(80px) saturate(1.45) brightness(0.55)',
-            opacity: 0.85,
-            pointerEvents: 'none',
-          }}
-        />
-      ) : null}
-      {/* Vignette over the backdrop so the cover & text always have contrast. */}
-      <div
-        aria-hidden
-        style={{
-          position: 'absolute', inset: 0,
-          background: 'radial-gradient(ellipse at center, rgba(0,0,0,0.0) 0%, rgba(0,0,0,0.55) 100%)',
-          pointerEvents: 'none',
-        }}
-      />
-
-      {/* Close pill — top-right. Dismisses the overlay; Escape works too. */}
-      <button
-        type="button"
-        onClick={(e) => { e.stopPropagation(); onClose?.(); }}
-        title="Close (Esc)"
-        aria-label="Close fullscreen"
-        style={{
-          position: 'absolute', top: 16, right: 16, zIndex: 2,
-          width: 36, height: 36, borderRadius: 999,
-          background: 'rgba(0,0,0,0.55)',
-          border: '1px solid rgba(255,255,255,0.14)',
-          color: 'rgba(255,255,255,0.85)', cursor: 'pointer',
-          display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0,
-          backdropFilter: 'blur(14px)', WebkitBackdropFilter: 'blur(14px)',
-          transition: 'background 0.15s, color 0.15s',
-        }}
-        onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(0,0,0,0.8)'; e.currentTarget.style.color = '#fff'; }}
-        onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(0,0,0,0.55)'; e.currentTarget.style.color = 'rgba(255,255,255,0.85)'; }}
-      >
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
-          <line x1="18" y1="6" x2="6" y2="18" />
-          <line x1="6" y1="6" x2="18" y2="18" />
-        </svg>
-      </button>
-
-      {/* The cover itself — clicking it should NOT close (only the backdrop). */}
-      <div
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          position: 'relative', zIndex: 1,
-          width: 'min(86vmin, 80vh)', aspectRatio: '1',
-          borderRadius: 18, overflow: 'hidden',
-          boxShadow: `0 32px 120px rgba(0,0,0,0.6), 0 0 0 1px rgba(${accent},0.4)`,
-          background: '#111',
-          animation: 'immerseFullscreenCoverIn 280ms cubic-bezier(0.2, 0.7, 0.2, 1)',
-          cursor: 'default',
-        }}
-      >
+  // The cover/controls rail. Reused whether or not lyrics exist — when there
+  // are no lyrics it simply centers in the screen on its own.
+  const rail = (
+    <div style={{
+      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+      gap: 0, padding: '40px 36px',
+      flexShrink: 0,
+      width: hasAnyLyrics ? 'clamp(320px, 34vw, 460px)' : 'auto',
+      ...(hasAnyLyrics ? {
+        background: 'rgba(255,255,255,0.045)',
+        borderRight: '1px solid rgba(255,255,255,0.08)',
+        backdropFilter: 'blur(28px) saturate(1.3)',
+        WebkitBackdropFilter: 'blur(28px) saturate(1.3)',
+        height: '100%',
+      } : {}),
+    }}>
+      {/* Cover */}
+      <div style={{
+        position: 'relative',
+        width: hasAnyLyrics ? 'min(26vw, 300px)' : 'min(58vh, 46vw)',
+        aspectRatio: '1', borderRadius: 16, overflow: 'hidden',
+        boxShadow: `0 24px 70px rgba(0,0,0,0.55), 0 0 0 1px rgba(${accent},0.4)`,
+        background: '#111',
+        animation: 'immerseFullscreenCoverIn 300ms cubic-bezier(0.2,0.7,0.2,1)',
+      }}>
         {coverUrl ? (
-          <img
-            src={coverUrl}
-            alt={title ? `Cover for ${title}` : 'Cover art'}
-            decoding="async"
-            style={{
-              width: '100%', height: '100%', objectFit: 'cover', display: 'block',
-              // High-quality scaling matters most here — the cover may be
-              // upscaled significantly to fill a 27"+ monitor.
-              imageRendering: 'high-quality',
-            }}
-            draggable={false}
-          />
+          <img src={coverUrl} alt={title ? `Cover for ${title}` : 'Cover art'}
+            decoding="async" draggable={false}
+            style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', imageRendering: 'high-quality' }} />
         ) : (
-          <div style={{
-            width: '100%', height: '100%',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            color: '#444',
-          }}>
+          <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#444' }}>
             <Icons.AlbumSidebar />
           </div>
         )}
       </div>
 
-      {/* Track info — sits below the cover, calm typography. */}
+      {/* Title / artist / album */}
+      <div style={{ textAlign: 'center', marginTop: 22, maxWidth: '100%' }}>
+        <div style={{
+          fontSize: 'clamp(19px, 2.4vmin, 26px)', fontWeight: 700, color: '#fff',
+          letterSpacing: '-0.01em', lineHeight: 1.15, textShadow: '0 2px 20px rgba(0,0,0,0.6)',
+          overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+        }}>{(title || 'No track').trim()}</div>
+        {artist ? (
+          <div style={{
+            marginTop: 5, fontSize: 'clamp(12px, 1.4vmin, 14px)', color: 'rgba(255,255,255,0.65)', fontWeight: 500,
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>
+            {artist.trim()}{album ? <span style={{ color: 'rgba(255,255,255,0.4)' }}>{` · ${album.trim()}`}</span> : null}
+          </div>
+        ) : null}
+      </div>
+
+      {/* Seek */}
+      <div style={{ width: '100%', maxWidth: 380, marginTop: 20, display: 'flex', alignItems: 'center', gap: 9 }}>
+        <span style={{ color: 'rgba(255,255,255,0.55)', fontSize: 10, fontVariantNumeric: 'tabular-nums', minWidth: 32, textAlign: 'right' }}>{formatTime(currentTime)}</span>
+        <HeartSlider value={currentTime} max={duration || 0} onChange={(v) => onSeek?.(v)} accent={accent} ariaLabel="Seek" thumbSize={12} />
+        <span style={{ color: 'rgba(255,255,255,0.55)', fontSize: 10, fontVariantNumeric: 'tabular-nums', minWidth: 32 }}>{formatTime(duration)}</span>
+      </div>
+
+      {/* Transport — same Reva controls as the dock */}
+      <div style={{ marginTop: 16, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 'clamp(18px, 2.4vmin, 26px)' }}>
+        <RevaSecondaryBtn onClick={onToggleShuffle} title="Shuffle" active={shuffleOn}>
+          <svg width="24" height="24" viewBox="0 0 28 32" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M5 9 C 12 9, 16 23, 23 23" /><path d="M5 23 C 12 23, 16 9, 23 9" />
+            <circle cx="5" cy="9" r="1.5" fill="currentColor" stroke="none" /><circle cx="5" cy="23" r="1.5" fill="currentColor" stroke="none" />
+            <circle cx="23" cy="9" r="1.5" fill="currentColor" stroke="none" /><circle cx="23" cy="23" r="1.5" fill="currentColor" stroke="none" />
+          </svg>
+        </RevaSecondaryBtn>
+        <RevaTransportBtn onClick={onPrev} title="Previous">
+          <svg width="26" height="26" viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M14 10.5 C 14 9.5, 13 9.1, 12.2 9.7 L 6 15 C 5.4 15.5, 5.4 16.5, 6 17 L 12.2 22.3 C 13 22.9, 14 22.5, 14 21.5 Z" />
+            <path d="M24 10.5 C 24 9.5, 23 9.1, 22.2 9.7 L 16 15 C 15.4 15.5, 15.4 16.5, 16 17 L 22.2 22.3 C 23 22.9, 24 22.5, 24 21.5 Z" />
+          </svg>
+        </RevaTransportBtn>
+        <RevaPlayBtn onClick={onTogglePlay} isPlaying={isPlaying} />
+        <RevaTransportBtn onClick={onNext} title="Next">
+          <svg width="26" height="26" viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M8 10.5 C 8 9.5, 9 9.1, 9.8 9.7 L 16 15 C 16.6 15.5, 16.6 16.5, 16 17 L 9.8 22.3 C 9 22.9, 8 22.5, 8 21.5 Z" />
+            <path d="M18 10.5 C 18 9.5, 19 9.1, 19.8 9.7 L 26 15 C 26.6 15.5, 26.6 16.5, 26 17 L 19.8 22.3 C 19 22.9, 18 22.5, 18 21.5 Z" />
+          </svg>
+        </RevaTransportBtn>
+        <RevaSecondaryBtn onClick={onToggleRepeat} title={`Repeat: ${repeat}`} active={repeat !== 'off'}>
+          {repeat === 'one' ? (
+            <svg width="24" height="24" viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M7 20 Q 7 7, 18 7 Q 25 7, 25 13" /><path d="M25 12 L 25 20 Q 25 25, 18 25 Q 11 25, 11 25" />
+              <circle cx="7" cy="20" r="1.5" fill="currentColor" stroke="none" />
+              <text x="16" y="20" fontSize="9" fontWeight="700" fill="currentColor" stroke="none" textAnchor="middle" dominantBaseline="middle">1</text>
+            </svg>
+          ) : (
+            <svg width="24" height="24" viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M7 18 Q 7 7, 18 7 L 23 7" /><path d="M20 4 L 24 7 L 20 10" />
+              <path d="M25 14 Q 25 25, 14 25 L 9 25" /><path d="M12 22 L 8 25 L 12 28" />
+            </svg>
+          )}
+        </RevaSecondaryBtn>
+      </div>
+    </div>
+  );
+
+  return (
+    <div
+      ref={dialogRef} role="dialog" aria-modal="true"
+      aria-label={`${title || 'Now playing'} — fullscreen`} tabIndex={-1}
+      onClick={onClose}
+      style={{
+        position: 'fixed', inset: 0, zIndex: 50,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        background: '#000', animation: 'immerseFullscreenIn 220ms ease-out', outline: 'none',
+      }}
+    >
+      <style>{`
+        @keyframes immerseFullscreenIn { 0% { opacity: 0; } 100% { opacity: 1; } }
+        @keyframes immerseFullscreenCoverIn { 0% { opacity: 0; transform: scale(0.96) translateY(8px); } 100% { opacity: 1; transform: scale(1) translateY(0); } }
+        @keyframes immerseFullscreenLyricsIn { 0% { opacity: 0; } 100% { opacity: 1; } }
+      `}</style>
+
+      {/* Blurred cover backdrop */}
+      {coverUrl ? (
+        <div aria-hidden style={{
+          position: 'absolute', inset: -80, backgroundImage: `url(${coverUrl})`,
+          backgroundSize: 'cover', backgroundPosition: 'center',
+          filter: 'blur(90px) saturate(1.5) brightness(0.5)', opacity: 0.85, pointerEvents: 'none',
+        }} />
+      ) : null}
+      <div aria-hidden style={{
+        position: 'absolute', inset: 0,
+        background: 'radial-gradient(ellipse at center, rgba(0,0,0,0.05) 0%, rgba(0,0,0,0.6) 100%)', pointerEvents: 'none',
+      }} />
+
+      {/* Draggable top strip */}
+      <div aria-hidden onClick={(e) => e.stopPropagation()} style={{
+        position: 'absolute', top: 0, left: 0, right: 0, height: 56, WebkitAppRegion: 'drag', zIndex: 4,
+      }} />
+
+      {/* Close — top-left, clear of OS window controls */}
+      <button type="button" onClick={(e) => { e.stopPropagation(); onClose?.(); }}
+        title="Close (Esc)" aria-label="Close fullscreen"
+        style={{
+          position: 'absolute', top: 16, left: 16, zIndex: 5, WebkitAppRegion: 'no-drag',
+          display: 'inline-flex', alignItems: 'center', gap: 7, height: 36, padding: '0 14px 0 11px',
+          borderRadius: 999, background: 'rgba(0,0,0,0.5)', border: '1px solid rgba(255,255,255,0.14)',
+          color: 'rgba(255,255,255,0.85)', cursor: 'pointer', fontSize: 12, fontWeight: 600,
+          backdropFilter: 'blur(14px)', WebkitBackdropFilter: 'blur(14px)', transition: 'background 0.15s, color 0.15s',
+        }}
+        onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(0,0,0,0.78)'; e.currentTarget.style.color = '#fff'; }}
+        onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(0,0,0,0.5)'; e.currentTarget.style.color = 'rgba(255,255,255,0.85)'; }}
+      >
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M19 12H5" /><path d="M12 19l-7-7 7-7" />
+        </svg>
+        Close
+      </button>
+
+      {/* Content: rail + (optional) lyrics centerpiece */}
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
-          position: 'relative', zIndex: 1,
-          marginTop: '3vmin', textAlign: 'center', maxWidth: '80vw', cursor: 'default',
+          position: 'relative', zIndex: 2, cursor: 'default',
+          display: 'flex', alignItems: 'stretch', justifyContent: 'center',
+          width: hasAnyLyrics ? '100%' : 'auto', height: hasAnyLyrics ? '100%' : 'auto',
+          maxWidth: '100vw',
         }}
       >
-        <div style={{
-          fontSize: 'clamp(18px, 2.4vmin, 28px)', fontWeight: 800, color: '#fff',
-          letterSpacing: '-0.02em', lineHeight: 1.15, textShadow: '0 2px 24px rgba(0,0,0,0.6)',
-        }}>
-          {(title || 'No track').trim()}
-        </div>
-        {artist ? (
+        {rail}
+        {hasAnyLyrics ? (
           <div style={{
-            marginTop: 6,
-            fontSize: 'clamp(13px, 1.6vmin, 17px)', color: 'rgba(255,255,255,0.78)', fontWeight: 500,
-            textShadow: '0 1px 14px rgba(0,0,0,0.55)',
+            flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center',
+            padding: '6vmin clamp(28px, 5vw, 80px)', minWidth: 0,
+            animation: 'immerseFullscreenLyricsIn 360ms ease-out both', animationDelay: '80ms',
           }}>
-            {artist.trim()}
-            {album ? <span style={{ color: 'rgba(255,255,255,0.45)' }}>{` · ${album.trim()}`}</span> : null}
+            {hasSyncedLyrics ? (
+              <SyncedLyrics
+                lines={lyricsData.synced}
+                currentTime={currentTime}
+                accent={accent}
+                onSeek={onSeek}
+                fontSize={21}
+                lineHeight={1.5}
+              />
+            ) : (
+              <PlainLyrics text={lyricsData.plain} fontSize={22} lineHeight={1.7} accent={accent} />
+            )}
           </div>
         ) : null}
-        <div style={{
-          marginTop: 14, fontSize: 10, letterSpacing: '0.08em',
-          color: 'rgba(255,255,255,0.35)', textTransform: 'uppercase',
-        }}>
-          esc to close
-        </div>
       </div>
     </div>
   );
@@ -3631,9 +3719,9 @@ function CoverFullscreenOverlay({ coverUrl, title, artist, album, accent, onClos
  *  button).
  * ========================================================================= */
 function LyricShareOverlay({
-  lines,             // array of strings — the selected lyric text lines
-  track,             // { title, artist, album, coverArt? }
-  coverUrl,          // resolved cover URL (may differ from track.coverArt)
+  lines,
+  track,
+  coverUrl,
   accent,
   onClose,
 }) {
@@ -3995,59 +4083,24 @@ function LyricShareOverlay({
   }, [accent, title, artist, trimmed, loadCoverImage, fitFontSize, wrapTextLine,
       SHARE_W, SHARE_H, TEXT_AREA_TOP, TEXT_AREA_H, TEXT_AREA_W, TEXT_PADDING_X]);
 
-  const handleCopyText = useCallback(async () => {
-    const body = trimmed.join('\n');
-    const sig = `\n\n— ${title} · ${artist}`;
-    try {
-      await navigator.clipboard.writeText(body + sig);
-      showInner('Lyrics copied');
-    } catch (err) {
-      console.error('copy text failed:', err);
-      showInner('Copy failed');
-    }
-  }, [trimmed, title, artist, showInner]);
-
-  const handleCopyImage = useCallback(async () => {
+  const handleShareWithFriends = useCallback(async () => {
     try {
       const blob = await rasterize();
-      // ClipboardItem only supports a small set of types; PNG is one.
       if (typeof ClipboardItem === 'undefined' || !navigator.clipboard?.write) {
-        throw new Error('ClipboardItem not supported in this environment');
+        throw new Error('ClipboardItem not supported');
       }
       await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
-      showInner('Image copied');
+      showInner('Image copied — paste in any chat');
     } catch (err) {
-      console.error('copy image failed:', err);
-      // Friendlier message — clipboard permission denial is a common cause.
+      console.error('share with friends failed:', err);
       const msg = /denied|permission|notallowed/i.test(String(err?.message || err))
-        ? 'Clipboard blocked — try Save'
+        ? 'Clipboard blocked'
         : 'Copy failed';
       showInner(msg);
     }
   }, [rasterize, showInner]);
 
-  const handleSaveImage = useCallback(async () => {
-    try {
-      const blob = await rasterize();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      const safeTitle = title.replace(/[^a-z0-9\-_ ]/gi, '').slice(0, 40).trim() || 'lyric';
-      a.href = url;
-      a.download = `${safeTitle} — immerse.png`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-      showInner('Image saved');
-    } catch (err) {
-      console.error('save image failed:', err);
-      showInner('Save failed');
-    }
-  }, [rasterize, title, showInner]);
-
   // --- Render ----------------------------------------------------------
-  // The visible preview inside the overlay is a CSS/HTML approximation of
-  // the SVG above — close enough that what the user sees is what they get.
   return (
     <div
       ref={dialogRef}
@@ -4059,11 +4112,12 @@ function LyricShareOverlay({
       style={{
         position: 'fixed', inset: 0, zIndex: 50,
         display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-        padding: '4vmin',
+        padding: 'clamp(12px, 3vmin, 28px)',
         background: '#000',
         cursor: 'zoom-out',
         animation: 'immerseFullscreenIn 220ms ease-out',
         outline: 'none',
+        overflow: 'auto',
       }}
     >
       <style>{`
@@ -4101,14 +4155,15 @@ function LyricShareOverlay({
         }}
       />
 
-      {/* Close pill */}
+      {/* Close — top-left so it does not overlap the window close button (top-right). */}
       <button
         type="button"
         onClick={(e) => { e.stopPropagation(); onClose?.(); }}
         title="Close (Esc)"
         aria-label="Close"
         style={{
-          position: 'absolute', top: 16, right: 16, zIndex: 2,
+          position: 'absolute', top: 16, left: 16, zIndex: 2,
+          WebkitAppRegion: 'no-drag',
           width: 36, height: 36, borderRadius: 999,
           background: 'rgba(0,0,0,0.55)',
           border: '1px solid rgba(255,255,255,0.14)',
@@ -4125,28 +4180,18 @@ function LyricShareOverlay({
         </svg>
       </button>
 
-      {/* The share card — visible preview. Pointer events stop here so a
-          click inside the card never bubbles to the backdrop's close.
-          Aspect is 4:5 portrait (1080×1350) to match the exported PNG and
-          to give every wrapped lyric line plenty of horizontal room. */}
       <div
         ref={cardRef}
         onClick={(e) => e.stopPropagation()}
         style={{
           position: 'relative', zIndex: 1,
-          // Sized to fit a comfortable viewing rectangle on most screens.
-          // The 4/5 aspect drives the actual shape; width is capped so the
-          // card never gets so tall that it crashes into the action bar.
-          width: 'min(440px, calc((100vh - 220px) * 0.8))',
+          width: 'min(440px, calc((100vh - 200px) * 0.8))',
           aspectRatio: '4 / 5',
           borderRadius: 22, overflow: 'hidden',
           boxShadow: `0 32px 120px rgba(0,0,0,0.65), 0 0 0 1px rgba(${accent},0.4), 0 0 60px rgba(${accent},0.12)`,
           background: '#111',
           animation: 'immerseShareCardIn 320ms cubic-bezier(0.2, 0.7, 0.2, 1)',
           cursor: 'default',
-          // Container-query root — all `cqi` units in descendants resolve
-          // against this card's width. Lets the header/lyric/footer text
-          // scale together with the card without separate clamp() math.
           containerType: 'inline-size',
         }}
       >
@@ -4174,8 +4219,6 @@ function LyricShareOverlay({
           }}
         />
 
-        {/* Top row — cover thumb + track meta. Proportions mirror the
-            SVG export (cover ~12% of width, sits ~10% from the top). */}
         <div style={{
           position: 'absolute',
           top: '9.6%', left: '9.2%', right: '9.2%',
@@ -4218,9 +4261,6 @@ function LyricShareOverlay({
           </div>
         </div>
 
-        {/* Lyric body — fills the middle band. Accent bar runs the full
-            band height. Font auto-scales by line count so 1-2 lines look
-            poster-sized and 8+ lines still fit. */}
         <div style={{
           position: 'absolute',
           top: '27%', bottom: '15%',
@@ -4238,9 +4278,6 @@ function LyricShareOverlay({
             flex: 1, minWidth: 0,
             display: 'flex', flexDirection: 'column', justifyContent: 'center',
             fontSize: (() => {
-              // Mirrors the canvas fitFontSize scale, in cqi units (% of
-              // card width). The breakpoints are chosen so the preview
-              // visually reflects what the exported PNG will look like.
               if (lineCount <= 1) return 'clamp(28px, 8.2cqi, 56px)';
               if (lineCount <= 2) return 'clamp(24px, 7.2cqi, 48px)';
               if (lineCount <= 4) return 'clamp(20px, 6cqi, 40px)';
@@ -4262,8 +4299,6 @@ function LyricShareOverlay({
           </div>
         </div>
 
-        {/* Footer — immerse wordmark + accent orb. Echoes the on-card
-            export, so the preview faithfully represents the saved image. */}
         <div style={{
           position: 'absolute', left: '9.2%', right: '9.2%',
           bottom: '7%',
@@ -4294,50 +4329,26 @@ function LyricShareOverlay({
         </div>
       </div>
 
-      {/* Action bar — sits below the card. Three actions: copy text,
-          copy image, save image. Styled as glass pills matching the dock. */}
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
           position: 'relative', zIndex: 1,
           marginTop: 'clamp(16px, 3vmin, 24px)',
-          display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'center',
           cursor: 'default',
         }}
       >
         <ShareActionButton
           accent={accent}
-          onClick={handleCopyText}
-          label="Copy text"
-          icon={(
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <rect x="9" y="9" width="13" height="13" rx="2" />
-              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-            </svg>
-          )}
-        />
-        <ShareActionButton
-          accent={accent}
           primary
-          onClick={handleCopyImage}
-          label="Copy image"
+          onClick={handleShareWithFriends}
+          label="Share with friends"
           icon={(
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <rect x="3" y="3" width="18" height="18" rx="2" />
-              <circle cx="8.5" cy="8.5" r="1.5" />
-              <polyline points="21 15 16 10 5 21" />
-            </svg>
-          )}
-        />
-        <ShareActionButton
-          accent={accent}
-          onClick={handleSaveImage}
-          label="Save image"
-          icon={(
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-              <polyline points="7 10 12 15 17 10" />
-              <line x1="12" y1="15" x2="12" y2="3" />
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="18" cy="5" r="3" />
+              <circle cx="6" cy="12" r="3" />
+              <circle cx="18" cy="19" r="3" />
+              <line x1="8.59" y1="13.51" x2="15.42" y2="17.49" />
+              <line x1="15.41" y1="6.51" x2="8.59" y2="10.49" />
             </svg>
           )}
         />
@@ -8554,6 +8565,42 @@ function LibraryTab({
               onAddToPlaylist={onAddToPlaylist}
               onTrackContextMenu={onTrackContextMenu}
               accent={accent}
+              onDownloadMissing={(track, ctx) => {
+                const apiRef = window.electronAPI;
+                if (!apiRef?.playlistImportBatch) { ctx.onStatus?.('failed'); return; }
+                const sid = track.spotifyId || track.title;
+                // Listen for this track's progress, then fire a one-track
+                // Soulseek import (reuses the full search/score/download flow).
+                let unsub = null;
+                if (apiRef.onPlaylistImportProgress) {
+                  unsub = apiRef.onPlaylistImportProgress((p) => {
+                    if (!p || (p.spotifyId !== sid && p.spotifyId !== track.spotifyId)) return;
+                    if (p.state === 'starting') ctx.onStatus?.('downloading');
+                    else if (p.state === 'done') { ctx.onStatus?.('done'); unsub?.(); }
+                    else if (p.state === 'failed') { ctx.onStatus?.('failed'); unsub?.(); }
+                  });
+                }
+                ctx.onStatus?.('downloading');
+                apiRef.playlistImportBatch({
+                  source: 'soulseek',
+                  tracks: [{
+                    spotifyId: sid,
+                    title: track.title,
+                    artists: track.artists || ctx.artist || '',
+                    album: ctx.album || '',
+                    albumArtUrl: ctx.albumArtUrl || '',
+                    durationMs: track.durationMs || 0,
+                    trackNumber: track.trackNumber || 0,
+                    explicit: track.explicit ? 1 : 0,
+                  }],
+                }).then((res) => {
+                  // Fallback in case progress events didn't fire.
+                  if (res && typeof res.completed === 'number') {
+                    ctx.onStatus?.(res.completed > 0 ? 'done' : 'failed');
+                  }
+                  unsub?.();
+                }).catch(() => { ctx.onStatus?.('failed'); unsub?.(); });
+              }}
             />
           </div>
         ) : (
@@ -9749,7 +9796,7 @@ function AlbumViewToggle({ mode, onChange }) {
   );
 }
 
-function AlbumDetailView({ album, tracks, currentTrack, isPlaying, hovered, setHovered, selectedId, setSelectedId, onBack, onPlayTrack, onPlayPauseTrack, canRemove, onRemoveFromLibrary, canEdit, onEditTrack, canEditAlbum, onEditAlbum, canAddToPlaylist, onAddToPlaylist, onTrackContextMenu, accent }) {
+function AlbumDetailView({ album, tracks, currentTrack, isPlaying, hovered, setHovered, selectedId, setSelectedId, onBack, onPlayTrack, onPlayPauseTrack, canRemove, onRemoveFromLibrary, canEdit, onEditTrack, canEditAlbum, onEditAlbum, canAddToPlaylist, onAddToPlaylist, onTrackContextMenu, accent, onDownloadMissing }) {
   const totalDuration = album.tracks.reduce((s, t) => s + (t.duration || 0), 0);
   const formatAlbumDuration = (sec) => {
     const h = Math.floor(sec / 3600);
@@ -9757,6 +9804,69 @@ function AlbumDetailView({ album, tracks, currentTrack, isPlaying, hovered, setH
     if (h > 0) return `${h} hr ${m} min`;
     return m > 0 ? `${m} min` : '< 1 min';
   };
+
+  // --- "Find missing tracks" feature -----------------------------------
+  // Resolves this library album to a Spotify edition (backend scores the best
+  // match + returns alternatives for the confirm/correct step), then lists the
+  // tracks the user doesn't own with a per-track download action.
+  const api = (typeof window !== 'undefined') ? window.electronAPI : null;
+  const canFindMissing = !!(api?.albumResolveMissing);
+  const [missingState, setMissingState] = useState('idle'); // idle | loading | done | error
+  const [missingResult, setMissingResult] = useState(null); // resolver payload
+  const [missingError, setMissingError] = useState('');
+  const [showEditionPicker, setShowEditionPicker] = useState(false);
+  // Per-missing-track download status: spotifyId -> 'queued'|'downloading'|'done'|'failed'
+  const [dlStatus, setDlStatus] = useState({});
+
+  const runResolve = useCallback(async (forcedAlbumId) => {
+    if (!api?.albumResolveMissing) return;
+    setMissingState('loading');
+    setMissingError('');
+    setShowEditionPicker(false);
+    try {
+      const res = await api.albumResolveMissing({
+        album: album.album,
+        artist: album.artist,
+        ownedTitles: album.tracks.map((t) => t.title).filter(Boolean),
+        albumId: forcedAlbumId || '',
+      });
+      if (!res?.ok) {
+        setMissingState('error');
+        setMissingError(res?.error || 'Could not look up this album.');
+        return;
+      }
+      setMissingResult(res);
+      setMissingState('done');
+    } catch (e) {
+      setMissingState('error');
+      setMissingError(String(e?.message || e));
+    }
+  }, [api, album]);
+
+  // Pick a specific edition from the alternatives, confirm + remember it.
+  const chooseEdition = useCallback(async (alt) => {
+    if (!api) return;
+    try {
+      await api.albumConfirmLink?.({
+        album: album.album, artist: album.artist, albumId: alt.albumId, confirmed: true,
+      });
+    } catch { /* non-fatal */ }
+    runResolve(alt.albumId);
+  }, [api, album, runResolve]);
+
+  const downloadMissing = useCallback((track) => {
+    if (!onDownloadMissing) return;
+    const id = track.spotifyId || track.title;
+    setDlStatus((s) => ({ ...s, [id]: 'queued' }));
+    onDownloadMissing(track, {
+      album: missingResult?.resolved?.name || album.album,
+      artist: album.artist,
+      albumArtUrl: missingResult?.resolved?.albumArtUrl || '',
+      onStatus: (status) => setDlStatus((s) => ({ ...s, [id]: status })),
+    });
+  }, [onDownloadMissing, missingResult, album]);
+
+  const missingCount = missingResult?.missing?.length || 0;
 
   // When search is filtering tracks, we only show the filtered subset.
   // Otherwise we use the full album structure (so discs are visible).
@@ -9855,70 +9965,106 @@ function AlbumDetailView({ album, tracks, currentTrack, isPlaying, hovered, setH
             {album.hasMultipleDiscs ? ` · ${album.discs.length} discs` : ''}
             {' · '}{formatAlbumDuration(totalDuration)}
           </div>
-          {/* Play all + Edit album buttons */}
-          <div style={{ display: 'flex', gap: 6, marginTop: 7, alignItems: 'center', flexWrap: 'wrap' }}>
+          {/* Action row — grouped: Play all is the standalone accent hero;
+              Edit / Add / Find missing share one inset glass segment, mirroring
+              the Songs/Albums/Playlists toggle so it reads as native Immerse. */}
+          <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center', flexWrap: 'wrap' }}>
             <button type="button"
               onClick={() => onPlayTrack(album.tracks[0])}
               style={{
-                padding: '5px 12px', borderRadius: 12, border: 'none',
-                background: `rgba(${accent},0.25)`, color: '#fff',
-                fontSize: 10.5, fontWeight: 700, lineHeight: 1,
+                padding: '8px 15px', borderRadius: 10, border: 'none',
+                background: `rgba(${accent},0.3)`, color: '#fff',
+                fontSize: 11.5, fontWeight: 600, lineHeight: 1,
                 cursor: 'pointer',
-                display: 'inline-flex', alignItems: 'center', gap: 6,
-              }}>
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" style={{ display: 'block' }}>
+                display: 'inline-flex', alignItems: 'center', gap: 7,
+                boxShadow: `0 2px 14px rgba(${accent},0.18)`,
+                transition: 'background 0.15s',
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = `rgba(${accent},0.42)`; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = `rgba(${accent},0.3)`; }}>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" style={{ display: 'block' }}>
                 <path d="M8 5v14l11-7z" />
               </svg>
               Play all
             </button>
-            {canEditAlbum ? (
-              <button type="button"
-                onClick={() => onEditAlbum({
-                  album: album.album,
-                  artist: album.artist,
-                  coverArt: album.coverArt,
-                  trackIds: album.tracks.map((t) => t.id),
-                  sampleTrack: album.tracks[0],
-                  discNumber: null, // null = whole-album scope
-                })}
-                title="Edit album metadata"
-                style={{
-                  padding: '5px 12px', borderRadius: 12,
-                  border: '1px solid rgba(255,255,255,0.1)',
-                  background: 'transparent', color: 'rgba(255,255,255,0.75)',
-                  fontSize: 10.5, fontWeight: 600, lineHeight: 1,
-                  cursor: 'pointer',
-                  display: 'inline-flex', alignItems: 'center', gap: 6,
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.06)'; e.currentTarget.style.color = '#fff'; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'rgba(255,255,255,0.75)'; }}>
-                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block' }}>
-                  <path d="M12 20h9" />
-                  <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
-                </svg>
-                Edit
-              </button>
-            ) : null}
-            {canAddToPlaylist ? (
-              <button type="button"
-                onClick={(e) => onAddToPlaylist(album.tracks.map((t) => t.id), e.currentTarget)}
-                title="Add album to playlist"
-                style={{
-                  padding: '5px 12px', borderRadius: 12,
-                  border: '1px solid rgba(255,255,255,0.1)',
-                  background: 'transparent', color: 'rgba(255,255,255,0.75)',
-                  fontSize: 10.5, fontWeight: 600, lineHeight: 1,
-                  cursor: 'pointer',
-                  display: 'inline-flex', alignItems: 'center', gap: 6,
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.06)'; e.currentTarget.style.color = '#fff'; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'rgba(255,255,255,0.75)'; }}>
-                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" style={{ display: 'block' }}>
-                  <line x1="12" y1="5" x2="12" y2="19" />
-                  <line x1="5" y1="12" x2="19" y2="12" />
-                </svg>
-                Add
-              </button>
+
+            {(canEditAlbum || canAddToPlaylist || canFindMissing) ? (
+              <div style={{
+                display: 'inline-flex', alignItems: 'center', gap: 2, padding: 3,
+                borderRadius: 11, background: 'rgba(255,255,255,0.05)',
+                border: '1px solid rgba(255,255,255,0.06)', flexWrap: 'wrap',
+              }}>
+                {canEditAlbum ? (
+                  <button type="button"
+                    onClick={() => onEditAlbum({
+                      album: album.album,
+                      artist: album.artist,
+                      coverArt: album.coverArt,
+                      trackIds: album.tracks.map((t) => t.id),
+                      sampleTrack: album.tracks[0],
+                      discNumber: null, // null = whole-album scope
+                    })}
+                    title="Edit album metadata"
+                    style={{
+                      padding: '6px 11px', borderRadius: 8, border: 'none',
+                      background: 'transparent', color: 'rgba(255,255,255,0.6)',
+                      fontSize: 11, fontWeight: 600, lineHeight: 1, cursor: 'pointer',
+                      display: 'inline-flex', alignItems: 'center', gap: 6,
+                      transition: 'background 0.15s, color 0.15s',
+                    }}
+                    onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.09)'; e.currentTarget.style.color = '#fff'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'rgba(255,255,255,0.6)'; }}>
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block' }}>
+                      <path d="M12 20h9" />
+                      <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+                    </svg>
+                    Edit
+                  </button>
+                ) : null}
+                {canAddToPlaylist ? (
+                  <button type="button"
+                    onClick={(e) => onAddToPlaylist(album.tracks.map((t) => t.id), e.currentTarget)}
+                    title="Add album to playlist"
+                    style={{
+                      padding: '6px 11px', borderRadius: 8, border: 'none',
+                      background: 'transparent', color: 'rgba(255,255,255,0.6)',
+                      fontSize: 11, fontWeight: 600, lineHeight: 1, cursor: 'pointer',
+                      display: 'inline-flex', alignItems: 'center', gap: 6,
+                      transition: 'background 0.15s, color 0.15s',
+                    }}
+                    onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.09)'; e.currentTarget.style.color = '#fff'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'rgba(255,255,255,0.6)'; }}>
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" style={{ display: 'block' }}>
+                      <line x1="12" y1="5" x2="12" y2="19" />
+                      <line x1="5" y1="12" x2="19" y2="12" />
+                    </svg>
+                    Add
+                  </button>
+                ) : null}
+                {canFindMissing ? (
+                  <button type="button"
+                    onClick={() => { if (missingState === 'done') { setMissingState('idle'); setMissingResult(null); } else { runResolve(); } }}
+                    title="Check this album against Spotify and find tracks you don't have yet"
+                    disabled={missingState === 'loading'}
+                    style={{
+                      padding: '6px 11px', borderRadius: 8, border: 'none',
+                      background: missingState === 'done' ? `rgba(${accent},0.32)` : 'transparent',
+                      color: missingState === 'loading' ? 'rgba(255,255,255,0.4)' : missingState === 'done' ? '#fff' : 'rgba(255,255,255,0.6)',
+                      fontSize: 11, fontWeight: 600, lineHeight: 1,
+                      cursor: missingState === 'loading' ? 'default' : 'pointer',
+                      display: 'inline-flex', alignItems: 'center', gap: 6,
+                      transition: 'background 0.15s, color 0.15s',
+                    }}
+                    onMouseEnter={(e) => { if (missingState !== 'loading' && missingState !== 'done') { e.currentTarget.style.background = 'rgba(255,255,255,0.09)'; e.currentTarget.style.color = '#fff'; } }}
+                    onMouseLeave={(e) => { if (missingState !== 'done') { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'rgba(255,255,255,0.6)'; } }}>
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block' }}>
+                      <circle cx="11" cy="11" r="7" />
+                      <path d="M21 21l-4.35-4.35" />
+                    </svg>
+                    {missingState === 'loading' ? 'Checking…' : missingState === 'done' ? 'Hide missing' : 'Find missing'}
+                  </button>
+                ) : null}
+              </div>
             ) : null}
           </div>
         </div>
@@ -9989,6 +10135,128 @@ function AlbumDetailView({ album, tracks, currentTrack, isPlaying, hovered, setH
       ) : (
         tracks.map((track, i) => renderTrackRow(track, i + 1))
       )}
+
+      {/* ---- Missing tracks section ---- */}
+      {missingState === 'error' ? (
+        <div style={{ margin: '10px 6px 4px', padding: '10px 12px', borderRadius: 10, background: 'rgba(243,114,114,0.08)', border: '1px solid rgba(243,114,114,0.18)', fontSize: 11, color: 'rgba(255,255,255,0.7)' }}>
+          {missingError || 'Could not look up this album.'}
+        </div>
+      ) : null}
+
+      {missingState === 'done' && missingResult ? (
+        <div style={{ marginTop: 10 }}>
+          {/* Resolved-edition bar + confirm/correct affordance */}
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+            padding: '8px 10px', margin: '0 6px 8px', borderRadius: 10,
+            background: 'rgba(255,255,255,0.035)', border: '1px solid rgba(255,255,255,0.06)',
+          }}>
+            <span style={{ fontSize: 10.5, color: 'rgba(255,255,255,0.55)' }}>
+              Matched to{' '}
+              <span style={{ color: 'rgba(255,255,255,0.85)', fontWeight: 600 }}>{missingResult.resolved?.name}</span>
+              {missingResult.resolved?.releaseDate ? <span style={{ color: 'rgba(255,255,255,0.4)' }}>{` · ${String(missingResult.resolved.releaseDate).slice(0, 4)}`}</span> : null}
+              <span style={{ color: 'rgba(255,255,255,0.4)' }}>{` · ${missingResult.resolved?.totalTracks || 0} tracks`}</span>
+              {missingResult.confirmed ? <span style={{ color: `rgba(${accent},0.9)`, marginLeft: 6, fontWeight: 600 }}>✓ confirmed</span> : null}
+            </span>
+            {(missingResult.alternatives?.length || 0) > 1 ? (
+              <button type="button"
+                onClick={() => setShowEditionPicker((v) => !v)}
+                style={{ marginLeft: 'auto', padding: '3px 9px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.1)', background: 'transparent', color: 'rgba(255,255,255,0.6)', fontSize: 10, fontWeight: 600, cursor: 'pointer' }}
+                onMouseEnter={(e) => { e.currentTarget.style.color = '#fff'; e.currentTarget.style.background = 'rgba(255,255,255,0.06)'; }}
+                onMouseLeave={(e) => { e.currentTarget.style.color = 'rgba(255,255,255,0.6)'; e.currentTarget.style.background = 'transparent'; }}>
+                {showEditionPicker ? 'Close' : 'Wrong album?'}
+              </button>
+            ) : null}
+          </div>
+
+          {/* Edition picker */}
+          {showEditionPicker ? (
+            <div style={{ margin: '0 6px 8px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+              {missingResult.alternatives.map((alt) => {
+                const isCurrent = alt.albumId === missingResult.resolved?.albumId;
+                return (
+                  <button key={alt.albumId} type="button"
+                    onClick={() => chooseEdition(alt)}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 8, textAlign: 'left',
+                      padding: '7px 10px', borderRadius: 8, cursor: 'pointer',
+                      border: isCurrent ? `1px solid rgba(${accent},0.5)` : '1px solid rgba(255,255,255,0.07)',
+                      background: isCurrent ? `rgba(${accent},0.12)` : 'rgba(255,255,255,0.02)',
+                    }}
+                    onMouseEnter={(e) => { if (!isCurrent) e.currentTarget.style.background = 'rgba(255,255,255,0.05)'; }}
+                    onMouseLeave={(e) => { if (!isCurrent) e.currentTarget.style.background = 'rgba(255,255,255,0.02)'; }}>
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: '#fff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{alt.name}</div>
+                      <div style={{ fontSize: 9.5, color: 'rgba(255,255,255,0.4)', marginTop: 1 }}>
+                        {alt.totalTracks} tracks{alt.releaseDate ? ` · ${String(alt.releaseDate).slice(0, 4)}` : ''} · {Math.round((alt.score || 0) * 100)}% match
+                      </div>
+                    </div>
+                    {isCurrent ? <span style={{ fontSize: 9.5, color: `rgba(${accent},0.9)`, fontWeight: 700 }}>current</span> : null}
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
+
+          {/* Section header */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px 6px' }}>
+            <span style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.85)' }}>
+              {missingCount === 0 ? 'Complete album' : `${missingCount} missing ${missingCount === 1 ? 'track' : 'tracks'}`}
+            </span>
+            {missingCount > 0 ? (
+              <span style={{ fontSize: 9.5, color: 'rgba(255,255,255,0.35)' }}>· not in your library</span>
+            ) : null}
+          </div>
+
+          {missingCount === 0 ? (
+            <div style={{ padding: '4px 8px 10px', fontSize: 10.5, color: 'rgba(255,255,255,0.45)' }}>
+              You have every track from this edition.
+            </div>
+          ) : (
+            missingResult.missing.map((mt) => {
+              const id = mt.spotifyId || mt.title;
+              const st = dlStatus[id];
+              return (
+                <div key={id}
+                  style={{ display: 'grid', gridTemplateColumns: '22px 1fr auto', alignItems: 'center', gap: 8, padding: '5px 8px', borderRadius: 8, opacity: st === 'done' ? 0.5 : 1 }}>
+                  <div style={{ width: 22, textAlign: 'center', color: 'rgba(255,255,255,0.3)', fontSize: 11, fontWeight: 500, fontVariantNumeric: 'tabular-nums' }}>
+                    {String(mt.trackNumber || '').padStart(2, '0') || '–'}
+                  </div>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 12, fontWeight: 500, color: 'rgba(255,255,255,0.55)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{mt.title}</span>
+                      {mt.explicit ? <ExplicitBadge /> : null}
+                    </div>
+                  </div>
+                  {st === 'done' ? (
+                    <span style={{ fontSize: 10, color: `rgba(${accent},0.9)`, fontWeight: 600, flexShrink: 0 }}>✓ added</span>
+                  ) : st === 'downloading' || st === 'queued' ? (
+                    <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', flexShrink: 0 }}>{st === 'queued' ? 'queued…' : 'downloading…'}</span>
+                  ) : st === 'failed' ? (
+                    <button type="button" onClick={() => downloadMissing(mt)}
+                      title="Download failed — retry"
+                      style={{ padding: '3px 10px', borderRadius: 8, border: '1px solid rgba(243,114,114,0.3)', background: 'rgba(243,114,114,0.1)', color: '#f3a0a0', fontSize: 10, fontWeight: 600, cursor: 'pointer', flexShrink: 0 }}>
+                      Retry
+                    </button>
+                  ) : (
+                    <button type="button" onClick={() => downloadMissing(mt)}
+                      title="Download this track via Soulseek"
+                      disabled={!onDownloadMissing}
+                      style={{ padding: '3px 10px', borderRadius: 8, border: `1px solid rgba(${accent},0.4)`, background: `rgba(${accent},0.16)`, color: '#fff', fontSize: 10, fontWeight: 600, cursor: onDownloadMissing ? 'pointer' : 'default', flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 5 }}
+                      onMouseEnter={(e) => { if (onDownloadMissing) e.currentTarget.style.background = `rgba(${accent},0.28)`; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.background = `rgba(${accent},0.16)`; }}>
+                      <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block' }}>
+                        <path d="M12 3v12" /><path d="M7 11l5 5 5-5" /><path d="M5 21h14" />
+                      </svg>
+                      Get
+                    </button>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </div>
+      ) : null}
     </>
   );
 }

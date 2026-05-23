@@ -223,6 +223,32 @@ function migrateAlbumNotesTable() {
 }
 
 /**
+ * album_links — remembers which Spotify album a library album was resolved /
+ * confirmed to, keyed by the same (album, artist) pair as album_notes. This
+ * powers the "missing tracks" feature: once an album is matched to a Spotify
+ * edition (auto or via the user's confirm/correct step), we store its ID so
+ * future opens are exact instead of re-running the fuzzy name search.
+ *   spotify_album_id  — the confirmed Spotify album ID
+ *   confirmed         — 1 if the user explicitly confirmed, 0 if auto-resolved
+ */
+function migrateAlbumLinksTable() {
+  try {
+    db.run(`
+      CREATE TABLE IF NOT EXISTS album_links (
+        album TEXT NOT NULL,
+        artist TEXT NOT NULL,
+        spotify_album_id TEXT NOT NULL,
+        confirmed INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
+        PRIMARY KEY (album, artist)
+      );
+    `);
+  } catch (e) {
+    console.error('migrateAlbumLinksTable', e);
+  }
+}
+
+/**
  * followed_artists — stores manual overrides for the "new releases" tracker.
  *   action='add'     → user explicitly follows (may not be in library)
  *   action='exclude' → user explicitly unfollows an auto-followed artist
@@ -490,6 +516,7 @@ export async function ensureLibraryOpen() {
       migrateTracksFavoritesNotesPlays();
       migrateTracksExplicit();
       migrateAlbumNotesTable();
+      migrateAlbumLinksTable();
       migrateFollowedArtistsTable();
       migrateArtistReleasesCacheTable();
       migrateInlineCoversToDisk();
@@ -1069,6 +1096,63 @@ export async function setAlbumNotes(album, artist, notes) {
     return { ok: true };
   } catch (e) {
     console.error('setAlbumNotes', e);
+    return { ok: false, error: String(e?.message || e) };
+  }
+}
+
+/**
+ * Get the stored Spotify album link for a library album, or null if none.
+ * Returns { spotifyAlbumId, confirmed, updatedAt }.
+ */
+export async function getAlbumLink(album, artist) {
+  await ensureLibraryOpen();
+  if (!db) return null;
+  const a = String(album || '').trim();
+  const ar = String(artist || '').trim();
+  if (!a) return null;
+  try {
+    const res = db.exec(
+      'SELECT spotify_album_id, confirmed, updated_at FROM album_links WHERE album = ? AND artist = ? LIMIT 1;',
+      [a, ar],
+    );
+    const row = res?.[0]?.values?.[0];
+    if (!row) return null;
+    return { spotifyAlbumId: String(row[0]), confirmed: !!row[1], updatedAt: Number(row[2]) };
+  } catch (e) {
+    console.error('getAlbumLink', e);
+    return null;
+  }
+}
+
+/**
+ * Store (or update) the Spotify album link for a library album. `confirmed`
+ * is true when the user explicitly picked the edition, false for an automatic
+ * resolution. Passing an empty spotifyAlbumId clears the link.
+ */
+export async function setAlbumLink(album, artist, spotifyAlbumId, confirmed = false) {
+  await ensureLibraryOpen();
+  if (!db) return { ok: false, error: 'DB not open' };
+  const a = String(album || '').trim();
+  const ar = String(artist || '').trim();
+  const sid = String(spotifyAlbumId || '').trim();
+  if (!a) return { ok: false, error: 'Album required' };
+  try {
+    if (sid) {
+      db.run(
+        `INSERT INTO album_links (album, artist, spotify_album_id, confirmed, updated_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(album, artist) DO UPDATE SET
+           spotify_album_id = excluded.spotify_album_id,
+           confirmed = excluded.confirmed,
+           updated_at = excluded.updated_at;`,
+        [a, ar, sid, confirmed ? 1 : 0, Date.now()],
+      );
+    } else {
+      db.run('DELETE FROM album_links WHERE album = ? AND artist = ?;', [a, ar]);
+    }
+    persistAtomic();
+    return { ok: true };
+  } catch (e) {
+    console.error('setAlbumLink', e);
     return { ok: false, error: String(e?.message || e) };
   }
 }
