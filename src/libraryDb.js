@@ -301,6 +301,18 @@ function migrateArtistReleasesCacheTable() {
       CREATE INDEX IF NOT EXISTS idx_artist_releases_release_date
       ON artist_releases_cache(release_date DESC);
     `);
+    // collection_explicitness: iTunes 'explicit' | 'cleaned' | 'notExplicit'.
+    // Added so the renderer can prefer the explicit edition when both an
+    // explicit and a cleaned copy of the same album are cached.
+    try {
+      const info = db.exec("PRAGMA table_info(artist_releases_cache);");
+      const cols = info?.[0]?.values?.map((r) => r[1]) || [];
+      if (!cols.includes('collection_explicitness')) {
+        db.run('ALTER TABLE artist_releases_cache ADD COLUMN collection_explicitness TEXT;');
+      }
+    } catch (e) {
+      console.error('migrate collection_explicitness', e);
+    }
   } catch (e) {
     console.error('migrateArtistReleasesCacheTable', e);
   }
@@ -1188,20 +1200,23 @@ export async function loadFollowedArtistOverrides() {
 
 /**
  * Explicitly follow an artist. Idempotent — overwrites any existing 'exclude'
- * override for the same name. Doesn't resolve the iTunes ID yet; that happens
- * on first fetch.
+ * override for the same name. If `itunesArtistId` is provided (user picked a
+ * specific artist from the disambiguation dropdown), it's stored so the refresh
+ * never has to guess which artist this name refers to.
  */
-export async function addFollowedArtist(artistName) {
+export async function addFollowedArtist(artistName, itunesArtistId = null) {
   await ensureLibraryOpen();
   if (!db) return { ok: false, error: 'DB not open' };
   const name = String(artistName || '').trim();
   if (!name) return { ok: false, error: 'Artist name required' };
+  const id = Number.isFinite(Number(itunesArtistId)) && Number(itunesArtistId) > 0
+    ? Number(itunesArtistId) : null;
   try {
     db.run(
       `INSERT INTO followed_artists (artist_name, action, itunes_artist_id, created_at)
-       VALUES (?, 'add', NULL, ?)
-       ON CONFLICT(artist_name) DO UPDATE SET action='add';`,
-      [name, Date.now()],
+       VALUES (?, 'add', ?, ?)
+       ON CONFLICT(artist_name) DO UPDATE SET action='add', itunes_artist_id=COALESCE(?, itunes_artist_id);`,
+      [name, id, Date.now(), id],
     );
     persistAtomic();
     return { ok: true };
@@ -1296,7 +1311,7 @@ export async function loadCachedReleases({ withinDays = 30 } = {}) {
     const res = db.exec(
       `SELECT itunes_artist_id, collection_id, collection_name, artist_name,
               release_date, artwork_url, track_count, collection_view_url,
-              primary_genre_name, cached_at
+              primary_genre_name, cached_at, collection_explicitness
        FROM artist_releases_cache
        WHERE release_date >= ?
        ORDER BY release_date DESC;`,
@@ -1314,6 +1329,7 @@ export async function loadCachedReleases({ withinDays = 30 } = {}) {
       collectionViewUrl: String(row[7] || ''),
       primaryGenreName: String(row[8] || ''),
       cachedAt: Number(row[9] || 0),
+      collectionExplicitness: String(row[10] || ''),
     }));
   } catch (e) {
     console.error('loadCachedReleases', e);
@@ -1336,8 +1352,8 @@ export async function upsertArtistReleases(releases) {
       `INSERT INTO artist_releases_cache
         (itunes_artist_id, collection_id, collection_name, artist_name,
          release_date, artwork_url, track_count, collection_view_url,
-         primary_genre_name, cached_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         primary_genre_name, cached_at, collection_explicitness)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(itunes_artist_id, collection_id) DO UPDATE SET
          collection_name = excluded.collection_name,
          artist_name = excluded.artist_name,
@@ -1346,7 +1362,8 @@ export async function upsertArtistReleases(releases) {
          track_count = excluded.track_count,
          collection_view_url = excluded.collection_view_url,
          primary_genre_name = excluded.primary_genre_name,
-         cached_at = excluded.cached_at;`,
+         cached_at = excluded.cached_at,
+         collection_explicitness = excluded.collection_explicitness;`,
     );
     const now = Date.now();
     for (const r of releases) {
@@ -1364,6 +1381,7 @@ export async function upsertArtistReleases(releases) {
         String(r.collectionViewUrl || ''),
         String(r.primaryGenreName || ''),
         now,
+        String(r.collectionExplicitness || ''),
       ]);
     }
     stmt.free();

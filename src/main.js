@@ -1,5 +1,13 @@
 import { app, BrowserWindow, ipcMain, dialog, protocol, net, shell } from 'electron';
 
+// ── Text rendering quality ─────────────────────────────────────────
+// Force sub-pixel font rendering so text stays crisp inside
+// backdrop-filter or GPU-composited layers. Without this, Chromium
+// may fall back to grayscale antialiasing which looks blurry on LCD
+// displays, especially on Windows with display scaling.
+app.commandLine.appendSwitch('enable-lcd-text', 'true');
+app.commandLine.appendSwitch('enable-gpu-rasterization');
+
 // Squirrel.Windows install/update/uninstall hooks. When Squirrel runs
 // any of these lifecycle events (install, first-run, update, uninstall),
 // it spawns the app with a special arg like --squirrel-firstrun or
@@ -3421,8 +3429,10 @@ ipcMain.handle('lyrics:fetch', async (event, { title, artist, album, duration, p
         else if (diff > 30) durationScore = -2;  // probably wrong version
       }
 
-      // Bonus for having synced lyrics — a synced match is more useful
-      const syncedBonus = r.syncedLyrics ? 2 : 0;
+      // Bonus for having synced lyrics — strongly prefer synced over plain.
+      // A +8 bonus ensures that a synced result will almost always beat a
+      // plain-only result unless the title/artist match is drastically worse.
+      const syncedBonus = r.syncedLyrics ? 8 : 0;
 
       return titleScore + artistScore + durationScore + syncedBonus;
     };
@@ -3463,6 +3473,12 @@ ipcMain.handle('lyrics:fetch', async (event, { title, artist, album, duration, p
         scored.sort((a, b) => b.score - a.score);
         const best = scored[0];
         if (!best || best.score < 8) return null;
+        // If the best result has no synced lyrics, check whether any
+        // synced result scores within 4 points of the best — prefer it.
+        if (!best.r.syncedLyrics) {
+          const bestSynced = scored.find((s) => s.r.syncedLyrics && s.score >= best.score - 4 && s.score >= 8);
+          if (bestSynced) return { ...bestSynced.r, __source: 'lrclib' };
+        }
         return { ...best.r, __source: 'lrclib' };
       } catch { return null; }
     };
@@ -3736,6 +3752,98 @@ ipcMain.handle('lyrics:save', async (event, { title, artist, syncedLyrics, plain
   }
 });
 
+/**
+ * lyrics:searchAll — returns ALL candidates from LRCLIB for a given query
+ * so the renderer can show a picker UI. Each candidate includes its
+ * synced/plain lyrics, metadata, and duration.
+ */
+ipcMain.handle('lyrics:searchAll', async (event, { title, artist, album, duration } = {}) => {
+  try {
+    const q = `${artist || ''} ${title || ''}`.trim();
+    if (!q) return { ok: true, candidates: [] };
+
+    const headers = { 'User-Agent': 'Immersive Music Player v1.0 (https://github.com/immersive)' };
+    const url = `https://lrclib.net/api/search?${new URLSearchParams({ q })}`;
+    console.log('[lyrics:searchAll] searching:', q);
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 12000);
+    let res;
+    try {
+      res = await net.fetch(url, { headers, signal: ctrl.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!res.ok) {
+      console.log('[lyrics:searchAll] LRCLIB returned', res.status);
+      return { ok: false, error: `LRCLIB returned ${res.status}` };
+    }
+    const data = await res.json();
+    console.log('[lyrics:searchAll] got', Array.isArray(data) ? data.length : 0, 'results');
+
+    if (!Array.isArray(data) || data.length === 0) return { ok: true, candidates: [] };
+
+    const normalizeStr = (s) => (s || '')
+      .toLowerCase().replace(/\(.*?\)|\[.*?\]/g, ' ')
+      .replace(/feat\.?|featuring|ft\.?/gi, ' ')
+      .replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+    const qTitle = normalizeStr(title);
+    const qArtist = normalizeStr(artist);
+
+    const candidates = data
+      .filter((r) => r && (r.syncedLyrics || r.plainLyrics))
+      .map((r) => {
+        const rTitle = normalizeStr(r.trackName || r.name || '');
+        const rArtist = normalizeStr(r.artistName || r.artist || '');
+        let score = 0;
+        if (rTitle === qTitle) score += 10;
+        else {
+          const rWords = new Set(rTitle.split(' ').filter((w) => w.length > 2));
+          const qWords = new Set(qTitle.split(' ').filter((w) => w.length > 2));
+          if (qWords.size > 0 && rWords.size > 0) {
+            let overlap = 0;
+            for (const w of qWords) if (rWords.has(w)) overlap++;
+            score += Math.round((overlap / Math.max(qWords.size, rWords.size)) * 8);
+          }
+        }
+        if (qArtist) {
+          const rAW = new Set(rArtist.split(' ').filter((w) => w.length >= 3));
+          if (qArtist.split(' ').filter((w) => w.length >= 3).some((w) => rAW.has(w))) score += 3;
+        }
+        const rDur = Number(r.duration) || 0;
+        const qDur = Number(duration) || 0;
+        if (qDur > 0 && rDur > 0) {
+          const diff = Math.abs(rDur - qDur);
+          if (diff <= 5) score += 3;
+          else if (diff <= 15) score += 1;
+          else if (diff > 30) score -= 2;
+        }
+        if (r.syncedLyrics) score += 8;
+        return {
+          id: r.id || null,
+          trackName: r.trackName || '',
+          artistName: r.artistName || '',
+          albumName: r.albumName || '',
+          duration: rDur,
+          hasSynced: !!r.syncedLyrics,
+          hasPlain: !!r.plainLyrics,
+          syncedLyrics: r.syncedLyrics || null,
+          plainLyrics: r.plainLyrics || null,
+          score,
+        };
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 20);
+
+    console.log('[lyrics:searchAll] returning', candidates.length, 'candidates');
+    return { ok: true, candidates };
+  } catch (e) {
+    console.error('[lyrics:searchAll] error:', e);
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
 /* =========================================================================
  *  iTunes "new releases" tracker
  *
@@ -3750,7 +3858,7 @@ ipcMain.handle('lyrics:save', async (event, { title, artist, syncedLyrics, plain
  * ========================================================================= */
 
 const ITUNES_API = 'https://itunes.apple.com';
-const ITUNES_RATE_DELAY_MS = 300; // ≈3 req/s, safely under 20/min
+const ITUNES_RATE_DELAY_MS = 1100; // ~55/min between artist refreshes. Apple throttles hard above ~20/min, so fetchJsonWithRetry also backs off + retries on 403/429.
 
 // Session-scoped status so the renderer can show "Refreshing…" UI
 let releasesRefreshInFlight = false;
@@ -3761,11 +3869,7 @@ let lastRefreshDebug = null; // { resolved: [{name, id, albumCount, recentCount}
 
 async function itunesSearchArtist(name) {
   const q = new URLSearchParams({ term: name, entity: 'musicArtist', limit: '5', media: 'music' });
-  const res = await net.fetch(`${ITUNES_API}/search?${q}`, {
-    headers: { 'User-Agent': 'Immerse/1.0' },
-  });
-  if (!res.ok) throw new Error(`iTunes search ${res.status}`);
-  const json = await res.json();
+  const json = await fetchJsonWithRetry(`${ITUNES_API}/search?${q}`);
   const results = Array.isArray(json?.results) ? json.results : [];
   // Pick the closest name match (case-insensitive equality first, then contains)
   const lower = name.trim().toLowerCase();
@@ -3781,17 +3885,173 @@ async function itunesLookupArtistAlbums(artistId, limit = 25) {
     limit: String(limit),
     sort: 'recent',
   });
-  const res = await net.fetch(`${ITUNES_API}/lookup?${q}`, {
-    headers: { 'User-Agent': 'Immerse/1.0' },
-  });
-  if (!res.ok) throw new Error(`iTunes lookup ${res.status}`);
-  const json = await res.json();
+  const json = await fetchJsonWithRetry(`${ITUNES_API}/lookup?${q}`);
   const rows = Array.isArray(json?.results) ? json.results : [];
   // First result is the artist itself, subsequent are albums
   return rows.filter((r) => r.wrapperType === 'collection' && r.collectionType === 'Album');
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// ---------------------------------------------------------------------------
+// Apple charts + artist search — backs the homepage charts (WelcomeScreen) and
+// the follow-artist picker (NewReleasesTab). Apple's search endpoint throttles
+// aggressively (~20 req/min → HTTP 403) and the RSS feed occasionally 5xx's,
+// so every call goes through fetchJsonWithRetry (exponential backoff on
+// 403/429/5xx) and results are cached briefly. These three IPC handlers are
+// the contract the renderer guards on: api.fetchCharts / api.lookupChartSong /
+// api.searchArtistCandidates.
+// ---------------------------------------------------------------------------
+const APPLE_RSS = 'https://rss.applemarketingtools.com/api/v2';
+const ITUNES_STOREFRONT = 'us';
+
+async function fetchJsonWithRetry(url, { retries = 3, timeoutMs = 9000 } = {}) {
+  let lastErr = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await net.fetch(url, { headers: { 'User-Agent': 'Immerse/1.0' }, signal: ctrl.signal });
+      clearTimeout(timer);
+      if (res.status === 403 || res.status === 429 || res.status >= 500) {
+        lastErr = new Error(`HTTP ${res.status}`);
+        if (attempt < retries) { await sleep(450 * Math.pow(2, attempt) + Math.random() * 250); continue; }
+        throw lastErr;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e;
+      if (attempt < retries) { await sleep(450 * Math.pow(2, attempt) + Math.random() * 250); continue; }
+      throw lastErr;
+    }
+  }
+  throw lastErr || new Error('fetch failed');
+}
+
+// Apple artwork URLs embed their size (e.g. .../100x100bb.jpg). Swap it up for
+// a crisper image without an extra request.
+function upscaleArtwork(url, size = 300) {
+  if (!url) return '';
+  return String(url).replace(/\/\d+x\d+(bb)?\./, `/${size}x${size}bb.`);
+}
+function pickGenre(genres) {
+  if (!Array.isArray(genres)) return '';
+  const g = genres.find((x) => x && x.name && x.name !== 'Music');
+  return g ? g.name : '';
+}
+
+let chartsCache = null; // { at, data }
+const CHARTS_TTL_MS = 30 * 60 * 1000;
+
+ipcMain.handle('charts:fetch', async () => {
+  try {
+    if (chartsCache && Date.now() - chartsCache.at < CHARTS_TTL_MS) return chartsCache.data;
+    const sf = ITUNES_STOREFRONT;
+    const [songsJson, albumsJson] = await Promise.all([
+      fetchJsonWithRetry(`${APPLE_RSS}/${sf}/music/most-played/50/songs.json`),
+      fetchJsonWithRetry(`${APPLE_RSS}/${sf}/music/most-played/50/albums.json`).catch(() => null),
+    ]);
+    const songs = (songsJson?.feed?.results || []).map((r) => ({
+      id: String(r.id),
+      name: r.name || '',
+      artistName: r.artistName || '',
+      artworkUrl: upscaleArtwork(r.artworkUrl100, 200),
+      genre: pickGenre(r.genres),
+    }));
+    const albums = (albumsJson?.feed?.results || []).map((r) => ({
+      id: Number(r.id),
+      name: r.name || '',
+      artistName: r.artistName || '',
+      artworkUrl: upscaleArtwork(r.artworkUrl100, 300),
+      releaseDate: r.releaseDate || '',
+      genre: pickGenre(r.genres),
+      itemType: 'album',
+    }));
+    const data = { ok: true, songs, albums };
+    chartsCache = { at: Date.now(), data };
+    return data;
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
+ipcMain.handle('charts:lookupSong', async (_e, id) => {
+  try {
+    if (!id) return { ok: false, error: 'no id' };
+    const json = await fetchJsonWithRetry(`${ITUNES_API}/lookup?id=${encodeURIComponent(id)}&entity=song&limit=1`);
+    const rows = Array.isArray(json?.results) ? json.results : [];
+    const row = rows.find((r) => r.wrapperType === 'track') || rows[0];
+    if (!row) return { ok: false, error: 'not found' };
+    return {
+      ok: true,
+      track: {
+        trackId: row.trackId,
+        trackName: row.trackName || '',
+        artistName: row.artistName || '',
+        collectionName: row.collectionName || '',
+        artworkUrl: upscaleArtwork(row.artworkUrl100, 600),
+        trackTimeMillis: row.trackTimeMillis || 0,
+        trackNumber: row.trackNumber || null,
+        explicit: String(row.trackExplicitness || '').toLowerCase() === 'explicit',
+      },
+    };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
+const artistSearchCache = new Map(); // qLower -> { at, data }
+const ARTIST_SEARCH_TTL_MS = 5 * 60 * 1000;
+
+ipcMain.handle('artists:searchCandidates', async (_e, q) => {
+  try {
+    const term = String(q || '').trim();
+    if (term.length < 2) return { ok: true, candidates: [] };
+    const key = term.toLowerCase();
+    const cached = artistSearchCache.get(key);
+    if (cached && Date.now() - cached.at < ARTIST_SEARCH_TTL_MS) return cached.data;
+
+    const params = new URLSearchParams({ term, entity: 'musicArtist', limit: '8', media: 'music' });
+    const json = await fetchJsonWithRetry(`${ITUNES_API}/search?${params}`);
+    const candidates = (Array.isArray(json?.results) ? json.results : [])
+      .filter((r) => r && r.artistId && (r.artistName || '').trim())
+      .map((r) => ({ artistId: r.artistId, artistName: r.artistName, genre: r.primaryGenreName || '' }));
+
+    // Best-effort enrichment: one batched lookup adds artwork, latest year and
+    // a rough release count so the picker rows aren't bare. If it throttles or
+    // fails, we still return the plain name+genre list.
+    if (candidates.length) {
+      try {
+        const ids = candidates.map((c) => c.artistId).join(',');
+        const lk = await fetchJsonWithRetry(`${ITUNES_API}/lookup?id=${ids}&entity=album&limit=80&sort=recent`);
+        const byArtist = new Map();
+        for (const row of (Array.isArray(lk?.results) ? lk.results : [])) {
+          if (row.wrapperType !== 'collection') continue;
+          const arr = byArtist.get(row.artistId) || [];
+          arr.push(row);
+          byArtist.set(row.artistId, arr);
+        }
+        for (const c of candidates) {
+          const al = byArtist.get(c.artistId) || [];
+          if (!al.length) continue;
+          al.sort((x, y) => (Date.parse(y.releaseDate || '') || 0) - (Date.parse(x.releaseDate || '') || 0));
+          c.artworkUrl = upscaleArtwork(al[0].artworkUrl100 || al[0].artworkUrl60, 120);
+          const yr = new Date(al[0].releaseDate || 0).getFullYear();
+          if (yr > 1900) c.latestYear = yr;
+          c.albumCount = al.length;
+        }
+      } catch { /* enrichment is optional */ }
+    }
+
+    const data = { ok: true, candidates };
+    artistSearchCache.set(key, { at: Date.now(), data });
+    return data;
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
 
 /**
  * Refresh releases for a list of artist names. Resolves each artist's iTunes

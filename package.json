@@ -1,7 +1,7 @@
 {
   "name": "immerse",
-  "version": "1.0.9",
-  "description": "Immersive — local music player",
+  "version": "1.1.0",
+  "description": "Immersive — Local Music Player",
   "author": "bray",
   "main": ".vite/build/main.js",
   "scripts": {
@@ -27,6 +27,7 @@
   "dependencies": {
     "@ryuziii/discord-rpc": "^1.0.1-rc.1",
     "electron-squirrel-startup": "^1.0.1",
+    "lucide-react": "^1.16.0",
     "music-metadata": "^7.14.0",
     "node-id3": "^0.2.9",
     "react": "^18.2.0",

@@ -118,6 +118,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   searchYoutubeCandidates: (params) => ipcRenderer.invoke('youtube:searchCandidates', params),
   fetchLyrics: (params) => ipcRenderer.invoke('lyrics:fetch', params),
   saveLyrics: (params) => ipcRenderer.invoke('lyrics:save', params),
+  searchAllLyrics: (params) => ipcRenderer.invoke('lyrics:searchAll', params),
   loadCachedReleases: () => ipcRenderer.invoke('releases:loadCached'),
   refreshReleases: (artistNames, mode) => ipcRenderer.invoke('releases:refresh', { artistNames, mode }),
   getReleasesDebug: () => ipcRenderer.invoke('releases:getDebug'),
@@ -126,6 +127,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   excludeFollowedArtist: (artistName) => ipcRenderer.invoke('releases:excludeArtist', artistName),
   clearFollowedArtistOverride: (artistName) => ipcRenderer.invoke('releases:clearOverride', artistName),
   lookupReleaseAlbumTracks: (collectionId) => ipcRenderer.invoke('releases:lookupAlbumTracks', collectionId),
+  // Apple charts (home) + follow-artist picker search
+  fetchCharts: () => ipcRenderer.invoke('charts:fetch'),
+  lookupChartSong: (id) => ipcRenderer.invoke('charts:lookupSong', id),
+  searchArtistCandidates: (q) => ipcRenderer.invoke('artists:searchCandidates', q),
   minimize: () => ipcRenderer.send('window:minimize'),
   maximize: () => ipcRenderer.send('window:maximize'),
   fullscreen: () => ipcRenderer.send('window:fullscreen'),

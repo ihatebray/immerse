@@ -9,41 +9,90 @@ import { getToolPaths } from './binPaths.js';
  *
  *  yt-dlp returns whatever it thinks is the best match for a search query.
  *  Without filtering, that means we sometimes get music videos, sped-up
- *  remixes, fan covers, or 10-hour loops instead of the studio recording the
- *  user asked for.
+ *  remixes, fan covers, clean radio edits, or 10-hour loops instead of the
+ *  studio recording the user asked for.
  *
- *  We score candidates against three tiers in order. The first non-empty tier
- *  wins. If all three are empty, the import FAILS — the user can choose
- *  manually via the Find tab. We never silently download a bad match.
+ *  The governing idea: WHATEVER SPOTIFY/iTUNES TOLD US IS THE TRACK WE WANT.
+ *  Spotify hands us an exact duration and an explicit flag for the track.
+ *  Our job is to find the YouTube upload that is the SAME RECORDING — same
+ *  master, same length, same explicit/clean status — and reject everything
+ *  else (live, remix, cover, music video, clean edit of an explicit song).
  *
- *  TIER 1 — official audio source from the artist's own channel:
- *    - Channel matches "<artist> - Topic" / "<artist>VEVO" / contains artist
- *    - Title does NOT suggest a music video
+ *  We score candidates against tiers in order. The first non-empty tier
+ *  wins; within a tier the candidate whose duration is closest to Spotify's
+ *  wins. If every tier is empty the import FAILS and the user picks manually
+ *  via the Find tab. We never silently download a bad match.
  *
- *  TIER 2 — explicitly labeled audio from any plausible source:
- *    - Title contains "Official Audio", "Audio", "Visualizer",
- *      or "Official Visualizer"
- *    - Channel either matches the artist OR looks like a record label
+ *  TIER 0 — the streaming master (best):
+ *    "<Artist> - Topic" auto-generated channel. These are uploaded by the
+ *    label/distributor from the exact audio that ships to Spotify/Apple
+ *    Music, so they match the target duration AND the target explicit
+ *    status automatically. If Spotify says the track is explicit, the
+ *    Topic upload IS the explicit master. This is the single most reliable
+ *    way to guarantee we get the explicit cut.
  *
- *  TIER 3 — lyric video, only if duration matches the target ±5s:
- *    - Title contains "Lyric" / "Lyrics"
- *    - Duration within 5s of the Spotify/iTunes target
+ *  TIER 1 — official audio from artist/label:
+ *    Title carries an "(Official Audio)" / "(Official Visualizer)" marker
+ *    (accepted from any channel), or a looser "Audio"/"Visualizer" marker
+ *    from the artist's own channel or a record label.
+ *
+ *  TIER 2 — lyric video:
+ *    Title says "Lyrics" / "Lyric Video", contains artist + song, duration
+ *    matches, and is NOT a "Clean Lyrics"/"Clean Version" upload.
+ *
+ *  TIER 3 — music video (OFF BY DEFAULT, see ALLOW_MUSIC_VIDEO_FALLBACK):
+ *    Disabled to honour "no music videos". When enabled it is the last
+ *    resort, gated on an EXACT duration match from an artist/label/Topic
+ *    channel — at exact duration the MV audio is the studio cut.
  *
  *  HARD REJECTS (never accepted in any tier):
- *    - Title suggests "music video", "M/V", "official video"
- *    - Title suggests "live", "cover", "karaoke", "instrumental",
- *      "8d audio", "sped up", "slowed", "nightcore", "reverb"
- *      UNLESS those words appeared in the original search query
+ *    - Snippets / previews / teasers / "part N of M" / loops / hour-long
+ *      uploads / extended edits.
+ *    - Clean / radio-edit / censored markers WHEN the target is explicit.
+ *    - Live / cover / karaoke / instrumental / remix / sped-up / slowed /
+ *      nightcore / mashup / bootleg — UNLESS that word was in the query.
  * ========================================================================= */
 
-/** Words that, when found in a title, should disqualify a candidate. */
+/* -------------------------------------------------------------------------
+ *  Tunable knobs
+ * ---------------------------------------------------------------------- */
+
+/**
+ * Music videos as a last-resort fallback. Default OFF: the user's stated
+ * preference is "no music videos". When a track has no Topic / Official
+ * Audio / lyric upload, the import will fail over to the manual picker
+ * instead of grabbing a music video.
+ *
+ * Flip to `true` if you find too many tracks failing to auto-import: it
+ * adds a Tier 3 that accepts an official music video ONLY when its duration
+ * matches Spotify's EXACTLY (±MV_DURATION_TOLERANCE_SEC) and it comes from
+ * the artist's channel, a label, or a Topic channel. At exact duration the
+ * music-video audio track is the same studio recording, so it is not a
+ * "wrong song" — it just may carry a spoken intro/outro on rare uploads,
+ * which the exact-duration gate filters out.
+ *
+ * This is only the DEFAULT. A per-import `allowMusicVideo` option (driven by
+ * the "Allow music videos as a last resort" setting in the UI) overrides it
+ * when provided.
+ */
+const ALLOW_MUSIC_VIDEO_FALLBACK = false;
+
+/** Duration tolerance (seconds) for the audio tiers (Topic / Official Audio). */
+const AUDIO_DURATION_TOLERANCE_SEC = 4;
+/** Duration tolerance for lyric videos — they sometimes carry a short graphic intro. */
+const LYRIC_DURATION_TOLERANCE_SEC = 5;
+/** Duration tolerance for the (optional) music-video fallback — must be near-exact. */
+const MV_DURATION_TOLERANCE_SEC = 2;
+
+/* -------------------------------------------------------------------------
+ *  Title / channel pattern banks
+ * ---------------------------------------------------------------------- */
+
+/** Words that, when found in a title, disqualify a candidate outright. */
 const HARD_REJECT_TITLE_PATTERNS = [
   // M/V is overwhelmingly used by fan/reaction/compilation channels in 2026.
   /\bM\/V\b/,
   // Partial/snippet/preview titles — fan uploads of incomplete tracks.
-  // These would otherwise sneak through duration checks if the partial
-  // happens to be close to the target length, or get accepted as Tier 1
-  // matches based on title/channel alone.
   /\bfirst\s*half\b/i,
   /\bsecond\s*half\b/i,
   /\bpart\s*\d+\s*of\s*\d+\b/i,
@@ -55,18 +104,25 @@ const HARD_REJECT_TITLE_PATTERNS = [
   /\boutro\s*only\b/i,
   /\b\(short\)/i,
   /\bshortened\b/i,
+  // Loops / hour-long / extended uploads. These would also fail the
+  // duration gate, but rejecting them by title avoids ever scoring them.
+  /\bloop(ed)?\b/i,
+  /\b\d+\s*hours?\b/i,
+  /\bextended\s*(version|mix|edit)\b/i,
 ];
 
-/** Channels that should be rejected outright. */
+/**
+ * Channel-level hard rejects. NOTE: "<Artist> - Topic" is deliberately NOT
+ * here any more — Topic channels are the streaming master and now win Tier 0.
+ */
 const HARD_REJECT_CHANNEL_PATTERNS = [
-  // Legacy "Drake - Topic" naming. The newer auto-audio channels drop this
-  // suffix and just use the artist name — those are filtered structurally
-  // by Tier 1's "title must contain artist name" requirement, since auto-
-  // audio uploads are titled with just the song name.
-  /\s-\s*topic\s*$/i,
+  // (Reserved for genuinely bad channels. Intentionally empty for now.)
 ];
 
-/** Conditional rejects — only applied if NOT in the user's query. */
+/**
+ * Conditional rejects — only applied if the word is NOT in the user's query.
+ * (If the user searched "drake live", they want a live version.)
+ */
 const CONDITIONAL_REJECT_PATTERNS = [
   { re: /\blive\b/i, key: 'live' },
   { re: /\bcover\b/i, key: 'cover' },
@@ -78,18 +134,55 @@ const CONDITIONAL_REJECT_PATTERNS = [
   { re: /\bnightcore\b/i, key: 'nightcore' },
   { re: /\breverb\b/i, key: 'reverb' },
   { re: /\bremix\b/i, key: 'remix' },
+  { re: /\bmashup\b/i, key: 'mashup' },
+  { re: /\bbootleg\b/i, key: 'bootleg' },
+  { re: /\bvip\s*(mix|edit)\b/i, key: 'vip' },
+  { re: /\bflip\b/i, key: 'flip' },
+  { re: /\brework\b/i, key: 'rework' },
+];
+
+/* -------------------------------------------------------------------------
+ *  Explicit / clean detection
+ *
+ *  Duration cannot tell a clean cut from an explicit one (clean versions
+ *  usually mute or reverse the word and keep the same length). The reliable
+ *  signals are (a) explicit title markers and (b) anchoring to the Topic
+ *  channel, whose upload mirrors the streaming master's explicit status.
+ * ---------------------------------------------------------------------- */
+
+/** Title markers that mean "this is the CLEAN / radio cut". */
+const CLEAN_MARKER_PATTERNS = [
+  /\(\s*clean\s*\)/i,
+  /\[\s*clean\s*\]/i,
+  /\bclean\s*version\b/i,
+  /\bclean\s*lyrics?\b/i,
+  /\bclean\s*audio\b/i,
+  /\bclean\s*edit\b/i,
+  /\bradio\s*edit\b/i,
+  /\bradio\s*version\b/i,
+  /\bcensored\b/i,
+  /\bbleeped\b/i,
+  /\bfamily\s*friendly\b/i,
+  /\bno\s*swearing\b/i,
+];
+
+/** Title markers that mean "this is the EXPLICIT / uncensored cut". */
+const EXPLICIT_MARKER_PATTERNS = [
+  /\(\s*explicit\s*\)/i,
+  /\[\s*explicit\s*\]/i,
+  /\bexplicit\s*version\b/i,
+  /\buncensored\b/i,
+  /\(\s*dirty\s*\)/i,
+  /\[\s*dirty\s*\]/i,
+  /\bdirty\s*version\b/i,
 ];
 
 /**
- * STRICT official-audio markers — phrases that fan/reupload accounts essentially
- * never use, because they're industry conventions for label/artist uploads.
- * "(Official Audio)" with the parens and "Official" prefix is the giveaway —
- * fan reuploads use "AUDIO" in caps, "Audio HQ", "Audio Only", etc.
- *
- * If a candidate title matches one of these, we accept it on the strength of
- * the title alone — the channel doesn't need to be on our label whitelist.
- * This is what lets uploads from named-only labels (Fueled By Ramen, OVO Sound,
- * Top Shelf, Polyvinyl, etc.) win without us having to maintain a list of
+ * STRICT official-audio markers — phrases fan/reupload accounts essentially
+ * never use because they're industry conventions for label/artist uploads.
+ * If a title matches one of these we accept it on the strength of the title
+ * alone (channel need not be whitelisted), which lets named-only labels
+ * (Fueled By Ramen, OVO Sound, Top Shelf, etc.) win without us enumerating
  * every label on Earth.
  */
 const STRICT_OFFICIAL_AUDIO_PATTERNS = [
@@ -99,11 +192,7 @@ const STRICT_OFFICIAL_AUDIO_PATTERNS = [
   /\[\s*official\s*visualizer\s*\]/i,
 ];
 
-/**
- * LOOSE official-audio markers — used as a wider net but require a label-
- * whitelisted channel as a guardrail because plain "Audio" or "Visualizer"
- * is much more ambiguous and could appear in fan-channel titles.
- */
+/** LOOSE official-audio markers — wider net, requires artist/label channel. */
 const OFFICIAL_AUDIO_TITLE_PATTERNS = [
   /\bofficial\s*audio\b/i,
   /\bofficial\s*visualizer\b/i,
@@ -111,12 +200,7 @@ const OFFICIAL_AUDIO_TITLE_PATTERNS = [
   /\baudio\b/i,
 ];
 
-/**
- * Music-video markers. Allowed only as the LAST option within Tier 1, behind
- * Audio/Visualizer titles, AND only if the duration matches exactly (±1s).
- * The exact duration check is the safety net — without it, any random fan
- * remix or extended edit with "music video" in the title would be eligible.
- */
+/** Music-video markers (only relevant when ALLOW_MUSIC_VIDEO_FALLBACK is on). */
 const MUSIC_VIDEO_PATTERNS = [
   /\bofficial\s*music\s*video\b/i,
   /\bmusic\s*video\b/i,
@@ -131,24 +215,8 @@ const LYRIC_VIDEO_PATTERNS = [
 ];
 
 /**
- * Specific anti-patterns for the lyric-video tier. A lyric video titled
- * "Clean Lyrics" or "(Clean Version)" is an explicit signal that this is the
- * radio edit, which is exactly what we DON'T want when the streaming service
- * told us the song is explicit. We reject these regardless of expected
- * explicit flag because: (a) the user can re-import as a folder if they want
- * the clean version, (b) the Audio/Visualizer tier 1 catches clean uploads
- * just fine when intentional.
- */
-const LYRIC_CLEAN_REJECT_PATTERNS = [
-  /\bclean\s*lyrics\b/i,
-  /\bclean\s*version\b/i,
-  /\(clean\)/i,
-];
-
-/**
- * Common record-label substrings (case-insensitive). Not exhaustive — this is
- * a sanity check, not a definitive list. Anything matching here counts as a
- * "label channel" for Tier 2.
+ * Common record-label substrings (case-insensitive). Not exhaustive — a
+ * sanity check, not a definitive list.
  */
 const LABEL_SUBSTRINGS = [
   'records', 'recordings', 'music group', 'entertainment', 'label',
@@ -159,10 +227,13 @@ const LABEL_SUBSTRINGS = [
   'big machine', 'glassnote', 'fader', 'aftermath', 'shady', 'mass appeal',
 ];
 
+/* -------------------------------------------------------------------------
+ *  Small helpers
+ * ---------------------------------------------------------------------- */
+
 /**
- * Strip common YouTube channel suffixes and decorations so we can compare
- * artist names directly. "Drake - Topic" → "drake", "Drake VEVO" → "drake",
- * "DrakeOfficial" → "drake".
+ * Strip common YouTube channel suffixes/decorations so artist names can be
+ * compared directly. "Drake - Topic" → "drake", "Drake VEVO" → "drake".
  */
 function normalizeChannelName(name) {
   if (!name) return '';
@@ -176,11 +247,7 @@ function normalizeChannelName(name) {
     .trim();
 }
 
-/**
- * Pull the primary artist out of a comma/feat-separated string. iTunes tends
- * to return "Drake feat. 21 Savage" for collabs; we want just "Drake" for
- * channel comparison.
- */
+/** Pull the primary artist out of a comma/feat-separated string. */
 function primaryArtist(s) {
   if (!s) return '';
   return String(s)
@@ -189,9 +256,7 @@ function primaryArtist(s) {
     .toLowerCase();
 }
 
-/**
- * Returns true if the candidate channel looks like a record label.
- */
+/** True if the channel name looks like a record label. */
 function isLabelChannel(channelName) {
   if (!channelName) return false;
   const lower = channelName.toLowerCase();
@@ -199,9 +264,78 @@ function isLabelChannel(channelName) {
 }
 
 /**
- * Returns true if the candidate channel matches the artist name.
- * Lenient match — substring after normalizing both sides.
+ * Strip noise from a title before comparison: parentheticals/brackets
+ * ("(feat. X)", "(Official Audio)", "[Lyrics]"), trailing "feat.." tails, and
+ * common decoration words. Then lowercase to a clean word list.
+ *
+ * The point is to compare the actual SONG NAME, not the marketing furniture.
+ * "Slide (feat. Future) [Official Audio]" and "Chase Atlantic - Slide" both
+ * reduce to the word "slide".
  */
+function songWordsOf(s) {
+  const cleaned = String(s || '')
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, ' ')        // (feat. X), (Official Audio), ...
+    .replace(/\[[^\]]*\]/g, ' ')       // [ ... ]
+    .replace(/\bfeat\.?\b[\s\S]*$/i, ' ') // trailing "feat ..."
+    .replace(/\bft\.?\b[\s\S]*$/i, ' ')   // trailing "ft ..."
+    .replace(/\b(official|audio|visualizer|lyric|lyrics|video|explicit|clean|hd|hq)\b/gi, ' ')
+    .replace(/[^a-z0-9\s]/g, ' ')      // punctuation → space
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned ? cleaned.split(' ') : [];
+}
+
+const SONG_TITLE_STOPWORDS = new Set(['the', 'a', 'an', 'and', 'of', 'to', 'in', 'on', 'for']);
+
+/**
+ * Does the candidate's title actually contain the SONG we asked for?
+ *
+ * This replaces the old per-character heuristic, which matched any two songs
+ * by the same artist that happened to share letters (e.g. "Angeline" matched
+ * "Ozone" — a, n, e, l, i, n, e all appear in "chaseatlanticozone"). We now
+ * match at the WORD level:
+ *
+ *   1. Exact joined-substring match of the cleaned song name (robust to
+ *      punctuation and to a YouTube title that omits/adds "(feat. X)").
+ *   2. Otherwise every significant song word must appear as a candidate word.
+ *
+ * A song word "counts" only as a whole word in the candidate (or as a
+ * joined-substring for one-word titles), never as a scatter of letters.
+ */
+function songTitleMatches(candidateTitle, songTitle) {
+  const songWords = songWordsOf(songTitle);
+  if (songWords.length === 0) return false;
+
+  const candWords = songWordsOf(candidateTitle);
+  const candSet = new Set(candWords);
+  const candJoined = candWords.join('');
+  const songJoined = songWords.join('');
+
+  // Single-word song title: require a WHOLE-WORD match. No substring gluing,
+  // so "Green" does not match "Greenmachine" and "Angeline" does not match
+  // "Ozone". (A short word that is a literal token of another title — e.g.
+  // "It" inside "Into It" — is the one residual ambiguity; the duration gate
+  // disambiguates those same-artist collisions.)
+  if (songWords.length === 1) {
+    return candSet.has(songWords[0]);
+  }
+
+  // Multi-word song title:
+  //   1. joined-substring match (a multi-word run rarely embeds in an
+  //      unrelated title; robust to added/omitted "(feat. X)").
+  if (songJoined.length >= 2 && candJoined.includes(songJoined)) return true;
+  //   2. otherwise ≥80% of the significant words must appear as whole words.
+  const significant = songWords.filter((w) => w.length >= 2 && !SONG_TITLE_STOPWORDS.has(w));
+  const words = significant.length > 0 ? significant : songWords;
+  let matched = 0;
+  for (const w of words) {
+    if (candSet.has(w)) matched++;
+  }
+  return matched / words.length >= 0.8;
+}
+
+/** True if the channel matches the artist (lenient substring after normalizing). */
 function channelMatchesArtist(channelName, artistName) {
   const c = normalizeChannelName(channelName);
   const a = primaryArtist(artistName);
@@ -209,10 +343,7 @@ function channelMatchesArtist(channelName, artistName) {
   return c === a || c.includes(a) || a.includes(c);
 }
 
-/**
- * Returns true if the candidate is a "Topic" auto-generated audio channel.
- * These are YouTube Music's pristine studio rips and the gold standard.
- */
+/** True if the channel is a "<Artist> - Topic" auto-generated audio channel. */
 function isTopicChannel(channelName) {
   return /\s-\s*topic\s*$/i.test(String(channelName || ''));
 }
@@ -222,20 +353,19 @@ function isVevoChannel(channelName) {
   return /vevo\s*$/i.test(String(channelName || ''));
 }
 
-/** Bucket of words that disqualify regardless of tier. */
+/** Title-level hard rejects (snippets, loops, M/V, hour-long, etc.). */
 function hasHardReject(title) {
   return HARD_REJECT_TITLE_PATTERNS.some((re) => re.test(title));
 }
 
-/** Channel-level hard rejects (e.g. legacy "Topic" channels). */
+/** Channel-level hard rejects. */
 function hasHardRejectChannel(channel) {
   return HARD_REJECT_CHANNEL_PATTERNS.some((re) => re.test(String(channel || '')));
 }
 
 /**
- * Check conditional rejects. A title with "Live" is only rejected if the
- * user's query did NOT also contain "live". (User searched for "Drake live"
- * → they want a live version; we shouldn't reject those.)
+ * Conditional rejects (live/cover/remix/etc.) — only fire when the word is
+ * absent from the query the user actually searched for.
  */
 function hasConditionalReject(title, query) {
   const queryLower = String(query || '').toLowerCase();
@@ -248,197 +378,170 @@ function hasConditionalReject(title, query) {
 }
 
 /**
- * Score a candidate against the locked-down tier system. Returns an object
- * describing which tier it fits and a tiebreaker score (lower wins).
+ * Decide whether a candidate's explicit/clean status is acceptable given
+ * what Spotify told us, and how much to nudge its score.
  *
- * STRICT TIER ORDER — only these patterns are ever accepted:
+ *   expectedExplicit === true   → Spotify says the track IS explicit.
+ *       Reject any clean/radio-edit upload. Prefer explicit-marked uploads.
+ *       Unmarked uploads are allowed (most originals are the explicit cut)
+ *       but rank below explicit-marked ones and below the Topic master.
  *
- *   TIER 1   (best): Title contains BOTH artist name AND song name. Channel
- *                    matches the artist (substring). Duration matches within
- *                    ±5s. Tiebreaker: higher view count wins (favors the
- *                    main artist channel over auto-audio "topic" channels
- *                    which usually have fewer views).
+ *   expectedExplicit === false  → the track has no profanity to begin with.
+ *       Clean vs explicit is moot; accept anything, no nudge.
  *
- *   TIER 1a  (next): All of Tier 1's requirements PLUS the title also
- *                    contains "Audio" / "Official Audio" / "Visualizer" /
- *                    "Official Visualizer". This is a super-set of Tier 1
- *                    so it would also match Tier 1 — but we score it
- *                    higher because the explicit "Audio" tag is the
- *                    strongest signal an upload is the canonical audio
- *                    version.
+ *   expectedExplicit === null   → unknown. Allow clean-marked uploads (so a
+ *       track whose only upload is clean still imports) but penalise them so
+ *       an unmarked/explicit alternative always wins.
  *
- *   TIER 1b  (last resort within Tier 1): Music video. Title contains
- *                    "Music Video" / "Official Music Video" / "Official
- *                    Video" + artist name + song name + EXACT duration
- *                    match (±1s). Channel must match artist or label.
- *
- *   TIER 2   (fallback): Lyric video. Title contains BOTH artist name AND
- *                    song name AND "Lyrics" / "Lyric Video". Duration
- *                    within ±5s. Hard rejects already filtered "Clean
- *                    Lyrics", "First Half", snippets, etc.
- *
- *   NOTHING ELSE QUALIFIES. If no candidate matches any tier, the import
- *   fails — the user will need to manually search via the Find tab.
- *
- * View count is used ONLY as a tiebreaker within the same tier. Higher view
- * count wins (this favors the canonical main-channel upload over auto-audio
- * channels and re-uploads). Implemented by subtracting a small fraction of
- * log(view_count) from the score.
- *
- * Explicit-aware penalty: when the streaming service told us the song
- * SHOULD be explicit, candidates with duration more than 3s off the target
- * take a +5 score penalty. Clean radio edits typically cut verses with
- * profanity (5+ seconds shorter), so duration mismatch is a strong signal.
+ * Returns { ok: boolean, bonus: number } where a NEGATIVE bonus improves the
+ * score (lower score wins).
  */
-function scoreCandidate(c, { artists, title, targetDurationSec, query, expectedExplicit }) {
+function explicitDecision(title, expectedExplicit) {
+  const hasClean = CLEAN_MARKER_PATTERNS.some((re) => re.test(title));
+  const hasExplicit = EXPLICIT_MARKER_PATTERNS.some((re) => re.test(title));
+
+  if (expectedExplicit === true) {
+    if (hasClean && !hasExplicit) return { ok: false, bonus: 0 };
+    return { ok: true, bonus: hasExplicit ? -1 : 0 };
+  }
+  if (expectedExplicit === false) {
+    return { ok: true, bonus: 0 };
+  }
+  // Unknown.
+  if (hasClean && !hasExplicit) return { ok: true, bonus: 3 };
+  return { ok: true, bonus: hasExplicit ? -1 : 0 };
+}
+
+/* -------------------------------------------------------------------------
+ *  Scoring
+ * ---------------------------------------------------------------------- */
+
+/**
+ * Score a candidate against the tier system. Returns { tier, score, sub } on
+ * a match (lower tier wins, then lower score), or { tier: null, reason } if
+ * the candidate is rejected.
+ *
+ * Within a tier the score is dominated by how close the candidate's duration
+ * is to Spotify's target, so the recording that actually matches the
+ * streaming length always wins. A tiny view-count tiebreaker favours the
+ * canonical upload when two candidates are otherwise identical.
+ */
+function scoreCandidate(c, { artists, title, targetDurationSec, query, expectedExplicit, allowMusicVideo }) {
+  // Per-import override of the module default. Lets the UI's "Allow music
+  // videos as a last resort" setting drive Tier 3 without a code change.
+  const allowMV = typeof allowMusicVideo === 'boolean' ? allowMusicVideo : ALLOW_MUSIC_VIDEO_FALLBACK;
   const candidateTitle = String(c.title || '');
   const candidateChannel = String(c.channel || c.uploader || '');
   const candidateDuration = Number(c.duration) || 0;
   const viewCount = Number(c.view_count) || 0;
 
   // ---- HARD REJECTS ----
-  // Title-level: M/V, snippets, partials, previews, teasers, etc.
   if (hasHardReject(candidateTitle)) return { tier: null, reason: 'hard reject (title)' };
-  // Channel-level: legacy "Topic" channels.
-  if (hasHardRejectChannel(candidateChannel)) return { tier: null, reason: 'hard reject (channel: Topic)' };
-  // Conditional: live, cover, karaoke, instrumental, sped-up, slowed, etc.
-  // (only if those words aren't in the original query).
+  if (hasHardRejectChannel(candidateChannel)) return { tier: null, reason: 'hard reject (channel)' };
   if (hasConditionalReject(candidateTitle, `${artists} ${title}`)) {
-    return { tier: null, reason: 'conditional reject (cover/karaoke/etc.)' };
+    return { tier: null, reason: 'conditional reject (live/cover/remix/etc.)' };
   }
 
+  // ---- Explicit / clean gate ----
+  const exp = explicitDecision(candidateTitle, expectedExplicit);
+  if (!exp.ok) return { tier: null, reason: 'clean cut of an explicit track' };
+
+  // ---- Duration ----
   const dur = candidateDuration;
   const target = targetDurationSec || 0;
   const durDiff = target > 0 ? Math.abs(dur - target) : 0;
 
-  // Explicit-aware penalty applied to durDiff.
-  const explicitPenalty = (expectedExplicit === true && target > 0 && durDiff > 3) ? 5 : 0;
+  const withinAudio = target <= 0 || durDiff <= AUDIO_DURATION_TOLERANCE_SEC;
+  const withinLyric = target <= 0 || durDiff <= LYRIC_DURATION_TOLERANCE_SEC;
+  const withinExact = target <= 0 || durDiff <= MV_DURATION_TOLERANCE_SEC;
 
-  // View-count tiebreaker. Higher views = lower score (better). We use
-  // log10 so the penalty difference between 1M and 10M views is the same
-  // as 100K vs 1M — small bonus, used only to break ties within a tier.
-  // Capped at -2 so view count can never override a real signal like
-  // duration mismatch.
+  // View-count tiebreaker (log10, capped) — never overrides a real signal.
   const viewBonus = viewCount > 0 ? -Math.min(2, Math.log10(viewCount) / 4) : 0;
-  const adjustedDiff = durDiff + explicitPenalty + viewBonus;
 
-  // ---- Pre-compute signals ----
-  const channelIsArtist = channelMatchesArtist(candidateChannel, artists);
-  const channelIsLabel = isLabelChannel(candidateChannel);
-  const hasOfficialAudioTitle = OFFICIAL_AUDIO_TITLE_PATTERNS.some((re) => re.test(candidateTitle));
-  const hasStrictOfficialAudioTitle = STRICT_OFFICIAL_AUDIO_PATTERNS.some((re) => re.test(candidateTitle));
-  const hasMusicVideoTitle = MUSIC_VIDEO_PATTERNS.some((re) => re.test(candidateTitle));
-  const isLyricVideo = LYRIC_VIDEO_PATTERNS.some((re) => re.test(candidateTitle));
-  const isCleanLyricVideo = LYRIC_CLEAN_REJECT_PATTERNS.some((re) => re.test(candidateTitle));
-  const isExactDurationMatch = target > 0 && Math.abs(Math.round(dur) - Math.round(target)) <= 1;
-  const isLooseDurationMatch = target > 0 && durDiff <= 5;
+  // Base score: distance from target, plus explicit nudge, plus tiebreaker.
+  // Lower wins.
+  const baseScore = durDiff + exp.bonus + viewBonus;
 
   // ---- Title-content checks ----
-  // Normalize for matching: lowercase, alphanumerics only. "Drake" matches
-  // "DRAKE", "drake & future" (substring), "Drake -" etc.
   const normalizeForMatch = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const candidateTitleNorm = normalizeForMatch(candidateTitle);
   const primaryArtistNorm = normalizeForMatch(primaryArtist(artists));
-  const titleNorm = normalizeForMatch(title);
+  // Artist match is a plain substring — the artist name does genuinely appear
+  // verbatim in real titles ("Chase Atlantic - Angeline"). The SONG match is
+  // word-level (see songTitleMatches) to avoid scatter-of-letters collisions.
   const titleContainsArtist = primaryArtistNorm.length > 0 && candidateTitleNorm.includes(primaryArtistNorm);
-  // Song name match: at least 70% of the song's normalized chars need to
-  // appear consecutively. Loose check because subtitles like "(feat. X)"
-  // may not be in the YouTube title even though the song is the same.
-  const titleContainsSong = (() => {
-    if (titleNorm.length === 0) return false;
-    if (candidateTitleNorm.includes(titleNorm)) return true;
-    // Fallback: check if at least 80% of the song's word characters appear
-    // (handles cases like "What Did I Miss?" → "What Did I Miss" stripped).
-    const songWords = titleNorm.length;
-    let matched = 0;
-    for (const ch of titleNorm) {
-      if (candidateTitleNorm.includes(ch)) matched++;
-    }
-    return matched / songWords >= 0.8 && titleNorm.length >= 3;
-  })();
+  const titleContainsSong = songTitleMatches(candidateTitle, title);
 
-  // ---- TIER 1: artist channel + artist name + song name in title ----
-  // The "first result is usually right" case. Title MUST contain both
-  // artist and song name (this is the strict rule that filters out the
-  // renamed-Topic auto-audio channels which title their uploads with just
-  // the song name). Channel must match artist. Duration ±5s.
-  // View count is the tiebreaker — main channel uploads almost always
-  // dominate auto-audio uploads in views, so this naturally selects the
-  // canonical version.
-  if (channelIsArtist && titleContainsArtist && titleContainsSong && isLooseDurationMatch) {
-    return { tier: 1.0, score: adjustedDiff, sub: 'artist-channel+full-title' };
+  // ---- Pre-computed signals ----
+  const channelIsArtist = channelMatchesArtist(candidateChannel, artists);
+  const channelIsLabel = isLabelChannel(candidateChannel);
+  const channelIsTopic = isTopicChannel(candidateChannel);
+  const channelIsVevo = isVevoChannel(candidateChannel);
+  const hasStrictAudio = STRICT_OFFICIAL_AUDIO_PATTERNS.some((re) => re.test(candidateTitle));
+  const hasLooseAudio = OFFICIAL_AUDIO_TITLE_PATTERNS.some((re) => re.test(candidateTitle));
+  const hasMusicVideo = MUSIC_VIDEO_PATTERNS.some((re) => re.test(candidateTitle));
+  const isLyricVideo = LYRIC_VIDEO_PATTERNS.some((re) => re.test(candidateTitle));
+
+  // ---- TIER 0: the streaming master ("<Artist> - Topic") ----
+  // Channel is "<artist> - Topic" (so it matches the artist after normalizing)
+  // and the title is the song. Duration must land in the audio window. This
+  // is the exact upload Spotify/Apple Music distribute from, so it carries
+  // the correct duration AND the correct explicit status by construction.
+  if (channelIsTopic && channelIsArtist && titleContainsSong && withinAudio) {
+    return { tier: 0, score: baseScore, sub: 'topic-master' };
   }
 
-  // ---- TIER 1a: artist+audio-title (refinement of Tier 1) ----
-  // Same as Tier 1 but the title also has Audio/Visualizer marker. This
-  // catches cases where the artist's main channel upload doesn't qualify
-  // for Tier 1 (e.g. the channel name doesn't contain the artist exactly,
-  // but a record label uploaded an "Official Audio" version with the
-  // artist+song in the title).
-  //
-  // Two acceptance paths:
-  //   1. STRICT marker — title contains "(Official Audio)" or
-  //      "(Official Visualizer)" (with parens). Fan accounts essentially
-  //      never use this exact format, so we accept the candidate from any
-  //      channel (no label whitelist required). This is what lets uploads
-  //      from labels like Fueled By Ramen / OVO Sound / Top Shelf / etc.
-  //      qualify without us having to enumerate every label that exists.
-  //   2. LOOSE marker — title contains plain "Audio" / "Visualizer" /
-  //      "Official Audio" without strict formatting. Requires the channel
-  //      to be on our label whitelist OR match the artist, because the
-  //      loose form is more ambiguous and fan reuploads often use it.
-  if (titleContainsArtist && titleContainsSong && isLooseDurationMatch) {
-    if (hasStrictOfficialAudioTitle) {
-      // Title alone is a strong-enough signal — channel can be anything
-      // (still subject to the channel hard-rejects above).
-      if (channelIsArtist) {
-        return { tier: 1.1, score: adjustedDiff, sub: 'artist+strict-audio-title' };
+  // ---- TIER 1: official audio ----
+  if (titleContainsArtist && titleContainsSong && withinAudio) {
+    // 1a — strict "(Official Audio)" / "(Official Visualizer)" marker.
+    // Accepted from any channel; fan accounts don't use this exact format.
+    if (hasStrictAudio) {
+      if (channelIsArtist || channelIsVevo) {
+        return { tier: 1, score: baseScore, sub: 'artist+strict-audio' };
       }
-      return { tier: 1.1, score: adjustedDiff + 0.5, sub: 'any+strict-audio-title' };
+      return { tier: 1, score: baseScore + 0.5, sub: 'any+strict-audio' };
     }
-    if (hasOfficialAudioTitle) {
-      if (channelIsArtist) {
-        return { tier: 1.1, score: adjustedDiff, sub: 'artist+audio-title' };
-      }
-      if (channelIsLabel) {
-        return { tier: 1.1, score: adjustedDiff + 1, sub: 'label+audio-title' };
-      }
+    // 1b — artist's own channel (or VEVO) with the song in the title.
+    if (channelIsArtist || channelIsVevo) {
+      return { tier: 1, score: baseScore + 0.25, sub: 'artist-channel' };
+    }
+    // 1c — loose audio marker, but only from a label channel.
+    if (hasLooseAudio && channelIsLabel) {
+      return { tier: 1, score: baseScore + 1, sub: 'label+loose-audio' };
     }
   }
 
-  // ---- TIER 1b: music video as last resort within Tier 1 ----
-  // Title says Music Video / Official Music Video / Official Video AND
-  // contains both artist and song name AND channel matches artist or label
-  // AND duration matches EXACTLY (±1s). The exact-duration check is
-  // critical — without it, fan compilations and edits would pass.
-  if (hasMusicVideoTitle && titleContainsArtist && titleContainsSong && isExactDurationMatch) {
-    if (channelIsArtist) {
-      return { tier: 1.5, score: adjustedDiff, sub: 'artist+music-video' };
-    }
-    if (channelIsLabel) {
-      return { tier: 1.5, score: adjustedDiff + 1, sub: 'label+music-video' };
-    }
+  // ---- TIER 2: lyric video ----
+  // Lyrics in the title, artist + song present, duration within the (slightly
+  // wider) lyric window. Clean lyric uploads were already rejected by the
+  // explicit gate when the target is explicit.
+  if (isLyricVideo && titleContainsArtist && titleContainsSong && withinLyric) {
+    return { tier: 2, score: baseScore, sub: 'lyric-video' };
   }
 
-  // ---- TIER 2: lyric video — must contain artist and song name ----
-  // Title says Lyrics / Lyric Video AND contains both artist and song
-  // name. NOT a Clean Lyrics / Clean Version upload (those are blocked).
-  // Snippets / first half etc. are blocked at the hard-reject level above.
-  // Duration ±5s.
-  if (isLyricVideo && !isCleanLyricVideo && titleContainsArtist && titleContainsSong && isLooseDurationMatch) {
-    return { tier: 2, score: adjustedDiff, sub: 'lyric-video' };
+  // ---- TIER 3: music video (last resort, OFF by default) ----
+  // Honours "no music videos" unless explicitly enabled. When enabled, only
+  // an EXACT-duration official MV from artist/label/Topic qualifies — at exact
+  // duration the audio is the studio cut.
+  if (allowMV
+      && hasMusicVideo && titleContainsArtist && titleContainsSong && withinExact) {
+    if (channelIsArtist || channelIsVevo) {
+      return { tier: 3, score: baseScore, sub: 'artist+music-video' };
+    }
+    if (channelIsLabel || channelIsTopic) {
+      return { tier: 3, score: baseScore + 1, sub: 'label+music-video' };
+    }
   }
 
   return { tier: null, reason: 'no tier match' };
 }
 
+/* -------------------------------------------------------------------------
+ *  Search / pick / download (I/O — unchanged behaviour)
+ * ---------------------------------------------------------------------- */
+
 /**
- * Search YouTube for candidates. Uses --flat-playlist mode for speed: instead
- * of yt-dlp doing a full info-extract on each video (which is slow because it
- * fetches the watch page for every result), we get a flat list with just the
- * fields we need — id, title, channel/uploader, duration. About 5-10x faster
- * than per-video extraction with no impact on scoring accuracy.
- *
+ * Search YouTube for candidates using --flat-playlist mode for speed.
  * Output is a single top-level JSON object with an `entries` array.
  */
 function searchYoutubeCandidates(query, count, ytDlp) {
@@ -446,8 +549,6 @@ function searchYoutubeCandidates(query, count, ytDlp) {
     const args = [
       '--skip-download',
       '--flat-playlist',
-      // -J emits a single JSON object for the whole search, much smaller than
-      // per-line -j when in flat-playlist mode.
       '-J',
       '--default-search', 'ytsearch',
       `ytsearch${count}:${query}`,
@@ -471,9 +572,6 @@ function searchYoutubeCandidates(query, count, ytDlp) {
         return;
       }
       const entries = Array.isArray(parsed?.entries) ? parsed.entries : [];
-      // Flat-playlist mode uses different field names than per-video mode.
-      // Normalize them so the scoring function (which reads c.title, c.channel,
-      // c.duration, c.id) works without changes.
       const candidates = entries
         .filter((e) => e?.id && e?.title)
         .map((e) => ({
@@ -500,8 +598,7 @@ function pickBestCandidate(candidates, params) {
 
   if (scored.length === 0) return null;
 
-  // Sort by tier ascending (1 wins), then score ascending (closer to target
-  // duration / better sub-source).
+  // Tier ascending (0 wins), then score ascending (closest duration / best source).
   scored.sort((a, b) => (a.tier - b.tier) || (a.score - b.score));
   return scored[0];
 }
@@ -552,21 +649,17 @@ function downloadById(videoId, { ytDlp, ffmpeg, outDir, stamp, onLog }) {
 }
 
 /**
- * Download the best YouTube match for "Artist Title" using a tiered
- * selection. The signature matches the previous version of this function;
- * `targetDurationSec` is new and optional but strongly improves accuracy.
+ * Download the best YouTube match for "Artist Title" using tiered selection.
  *
  *   targetDurationSec — expected song length in seconds (from Spotify/iTunes).
- *                        Used for duration matching in Tier 3 and as a
- *                        tiebreaker within tiers.
+ *                        Primary discriminator; closest match wins each tier.
+ *   expectedExplicit  — Spotify's explicit flag (true/false/null). Drives the
+ *                        clean-cut rejection.
  *
- * Returns an absolute path to the written .mp3.
- *
- * Throws if no candidate satisfies any tier — caller should handle the
- * failure (the renderer already does, marking the track as "failed" and
- * letting the user manually search via Find tab).
+ * Returns an absolute path to the written .mp3. Throws (with a structured
+ * `no-tier-match` error carrying candidates) if nothing qualifies.
  */
-export async function downloadYoutubeAudioForQuery({ artists, title, targetDurationSec = 0, expectedExplicit = null }, { onLog } = {}) {
+export async function downloadYoutubeAudioForQuery({ artists, title, targetDurationSec = 0, expectedExplicit = null, allowMusicVideo = null }, { onLog } = {}) {
   const { ytDlp, ffmpeg } = getToolPaths();
   if (!fs.existsSync(ytDlp)) {
     throw new Error('yt-dlp not found. Run: npm run setup:binaries');
@@ -579,29 +672,22 @@ export async function downloadYoutubeAudioForQuery({ artists, title, targetDurat
   const explicitTag = expectedExplicit === true ? ' [explicit]' : (expectedExplicit === false ? ' [clean]' : '');
   onLog?.(`[ytdlp] parallel search for "${baseQuery}" (target duration: ${targetDurationSec || '?'}s)${explicitTag}\n`);
 
-  // Three parallel searches, each looking for a different signal:
-  //   - Plain query: catches the artist's own channel uploads (Tier 1a)
-  //   - Audio variant: surfaces "Official Audio" / "Visualizer" uploads (Tier 1b)
-  //   - Music Video variant: surfaces "Official Music Video" uploads (Tier 1c)
-  // Lyric video matches show up in any of these searches because YouTube's
-  // ranking surfaces lyric videos broadly.
-  //
-  // Each search fetches 8 candidates so the combined pool is ~24 (after
-  // dedupe by video ID, usually ~15-18 unique). Running them in parallel
-  // keeps total latency at ~2s — the slowest single search — instead of
-  // ~6s sequentially.
+  // Three parallel searches, each surfacing a different source:
+  //   - Plain query: catches the artist's own channel AND the "- Topic" master.
+  //   - Audio variant: surfaces "Official Audio" / "Visualizer" uploads.
+  //   - Lyrics variant: surfaces lyric videos for tracks with no clean audio
+  //     source. (Replaces the old "Official Music Video" probe, since music
+  //     videos are no longer a default tier.)
   const queries = [
     baseQuery,
     `${baseQuery} Official Audio`,
-    `${baseQuery} Official Music Video`,
+    `${baseQuery} Lyrics`,
   ];
   let allCandidates;
   try {
     const results = await Promise.all(
       queries.map((q) => searchYoutubeCandidates(q, 8, ytDlp).catch(() => []))
     );
-    // Flatten and dedupe by video ID — multiple queries often surface the
-    // same video.
     const seen = new Set();
     allCandidates = [];
     for (const list of results) {
@@ -620,13 +706,9 @@ export async function downloadYoutubeAudioForQuery({ artists, title, targetDurat
   }
   onLog?.(`[ytdlp] got ${allCandidates.length} unique candidates from 3 queries, scoring…\n`);
 
-  const winner = pickBestCandidate(allCandidates, { artists, title, targetDurationSec, query: baseQuery, expectedExplicit });
+  const winner = pickBestCandidate(allCandidates, { artists, title, targetDurationSec, query: baseQuery, expectedExplicit, allowMusicVideo });
   if (!winner) {
-    // Throw a structured error containing the top candidates. The IPC
-    // handler in main.js detects this and returns them to the renderer
-    // so the user can pick one manually via the candidate-picker modal.
-    // Sort by view count so the most-watched options surface first —
-    // that's almost always what the user wants when manually picking.
+    // Structured failure — main.js surfaces these in the manual picker.
     const sortedCandidates = [...allCandidates].sort(
       (a, b) => (Number(b.view_count) || 0) - (Number(a.view_count) || 0)
     );
@@ -656,10 +738,7 @@ export async function downloadYoutubeAudioForQuery({ artists, title, targetDurat
 
 /**
  * Download a specific YouTube video by its ID, bypassing all tier matching.
- * Used by the manual-pick flow: when an automatic import fails and the user
- * picks a candidate from the modal, we call this with the video ID.
- *
- * Returns an absolute path to the written .mp3 file.
+ * Used by the manual-pick flow.
  */
 export async function downloadYoutubeAudioById(videoId, { onLog } = {}) {
   const { ytDlp, ffmpeg } = getToolPaths();
@@ -673,43 +752,30 @@ export async function downloadYoutubeAudioById(videoId, { onLog } = {}) {
 }
 
 /**
- * Search-only path: runs the same parallel multi-query search as
- * downloadYoutubeAudioForQuery but returns the candidates directly,
- * without tier scoring or download. Used by the "always show picker"
- * setting in Settings — when on, every import surfaces the picker first
- * instead of relying on the tier matcher.
+ * Search-only path for the manual picker. Same multi-query search as the auto
+ * import, but returns candidates directly without tier scoring or download.
  *
- * Returns up to 12 candidates, sorted by view count descending (highest
- * first — usually what the user wants when manually picking).
+ * Returns up to 12 (or 24 for custom queries) candidates, sorted by view count.
  */
 export async function searchCandidatesForPicker({ artists, title, customQuery }, { onLog } = {}) {
   const { ytDlp } = getToolPaths();
   if (!fs.existsSync(ytDlp)) {
     throw new Error('yt-dlp not found. Run: npm run setup:binaries');
   }
-  // When the user has refined their search via the picker's search box,
-  // we use their text verbatim and DON'T append the "Official Audio" /
-  // "Official Music Video" variants — they already know what they want.
-  // Otherwise (default flow), use the standard artist+title and run the
-  // three-variant parallel search to cast a wider net.
   const cleanCustom = String(customQuery || '').trim();
   const useCustom = cleanCustom.length > 0;
   const baseQuery = useCustom
     ? cleanCustom.replace(/"/g, "'")
     : `${artists} ${title}`.replace(/"/g, "'").trim();
-  // Always-on log so we can verify in the terminal whether the custom path
-  // is actually being taken (was getting confused with stale main.js builds).
   console.log(`[ytdlp picker] useCustom=${useCustom} query="${baseQuery}" (artists="${artists}", title="${title}", customQuery="${customQuery}")`);
   onLog?.(`[ytdlp] picker-mode search for "${baseQuery}"${useCustom ? ' (custom, no rejects, 24 results)' : ''}\n`);
 
-  // For custom queries, do ONE search with 16 results (more breadth on a
-  // single query). For default queries, do the three-variant parallel search.
   const queries = useCustom
     ? [baseQuery]
     : [
         baseQuery,
         `${baseQuery} Official Audio`,
-        `${baseQuery} Official Music Video`,
+        `${baseQuery} Lyrics`,
       ];
   const perQueryCount = useCustom ? 30 : 8;
   const results = await Promise.all(
@@ -725,18 +791,9 @@ export async function searchCandidatesForPicker({ artists, title, customQuery },
       }
     }
   }
-  // Filter out hard-rejects (snippets, partials, M/V, Topic channels) so
-  // the picker doesn't surface obvious junk in the default flow.
-  // EXCEPTION 1: when the user typed a custom query in the refine-search
-  // box, skip ALL hard-rejects. They asked for it — they get whatever
-  // YouTube returns. Search is more useful when it doesn't second-guess
-  // the user.
-  // EXCEPTION 2: if the strict filter empties the result set (which
-  // happens for less popular tracks where only Topic channels host the
-  // song), fall back to the unfiltered list. "Better something than
-  // nothing" — the user can decide what's worth picking. We still drop
-  // title-level rejects (snippets/partials) since those are almost
-  // certainly junk regardless.
+  // Default flow drops obvious junk (snippets/partials/loops). Custom queries
+  // are trusted verbatim. If the strict filter empties the list, fall back to
+  // dropping only title-level junk.
   let filtered;
   if (useCustom) {
     filtered = allCandidates;
@@ -749,17 +806,11 @@ export async function searchCandidatesForPicker({ artists, title, customQuery },
     if (strict.length > 0) {
       filtered = strict;
     } else {
-      // Lenient fallback — only drop title-level rejects (snippets, partials).
-      // Allow Topic channels through.
       filtered = allCandidates.filter((c) => !hasHardReject(String(c.title || '')));
-      console.log(`[ytdlp picker] strict filter emptied results, falling back to lenient (allowing Topic channels)`);
+      console.log(`[ytdlp picker] strict filter emptied results, falling back to lenient`);
     }
   }
   filtered.sort((a, b) => (Number(b.view_count) || 0) - (Number(a.view_count) || 0));
-  // Custom queries return more results (24 vs 12). The default flow only
-  // surfaces 12 because that's already enough when the tier matcher failed —
-  // scrolling further almost never helps. Refined searches benefit from
-  // the wider net since the user might be hunting something specific.
   const limit = useCustom ? 24 : 12;
   console.log(`[ytdlp picker] raw=${allCandidates.length}, filtered=${filtered.length}, returning=${Math.min(filtered.length, limit)} (limit=${limit})`);
   return filtered.slice(0, limit).map((c) => ({

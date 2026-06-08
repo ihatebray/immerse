@@ -40,6 +40,22 @@ const Icons = {
       <circle cx="12" cy="12" r="3" />
     </svg>
   ),
+  NewReleases: () => (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="9.5" />
+      <path d="M15.5 8.5l-2 5-5 2 2-5z" fill="currentColor" stroke="none" />
+    </svg>
+  ),
+  Stats: () => (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+      {/* Bold filled bar chart. Same 20×20 / 0 0 24 24 frame as every other
+          dock icon; bars span the box (≈4–20 vertically, 3→21 horizontally)
+          so the filled weight reads at the same scale as the stroked siblings. */}
+      <rect x="3" y="11" width="4.6" height="9" rx="1.4" />
+      <rect x="9.7" y="4" width="4.6" height="16" rx="1.4" />
+      <rect x="16.4" y="8" width="4.6" height="12" rx="1.4" />
+    </svg>
+  ),
   Play: () => (
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="0" strokeLinecap="round" strokeLinejoin="round">
       <path d="M7.5 4.5a1 1 0 0 1 1.5-.86l10 7a1 1 0 0 1 0 1.72l-10 7A1 1 0 0 1 7.5 18.5v-14z" fill="currentColor" />

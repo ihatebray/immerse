@@ -1,16 +1,33 @@
 /**
- * Toasts.jsx — Symmetrical 3D Kinetic Notification Stack
+ * Toasts.jsx — Immerse notification system.
  *
- * Implements a unified physics model where entrance and exit animations
- * perfectly mirror each other. Banners swing down out of a 3D perspective
- * plane on arrival, and snap smoothly back up into that exact same 3D 
- * plane upon dismissal, preventing any jarring layout snaps.
+ * Exports:
+ *   useToastBus()  — creates the toast state (used once in App.jsx)
+ *   ToastStack     — renders the floating toast UI
+ *   ToastContext    — React context for pushToast
+ *   useToast()     — hook for any component to push a toast
+ *
+ * Usage in any extracted component:
+ *   import { useToast } from './Toasts.jsx';
+ *   const pushToast = useToast();
+ *   pushToast({ message: 'Saved', kind: 'success' });
  */
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 
 const DEFAULT_DURATION_MS = 5000;
 const MAX_VISIBLE_TOASTS = 4;
+
+/* ── Context ────────────────────────────────────────────────── */
+
+export const ToastContext = createContext(() => {});
+
+/** Hook for any component to push a toast. */
+export function useToast() {
+  return useContext(ToastContext);
+}
+
+/* ── Bus (state owner — called once in App.jsx) ─────────────── */
 
 export function useToastBus() {
   const [toasts, setToasts] = useState([]);
@@ -45,6 +62,8 @@ export function useToastBus() {
   return { toasts, pushToast, dismissToast };
 }
 
+/* ── Visual stack ────────────────────────────────────────────── */
+
 export function ToastStack({ toasts, onDismiss, accent = '128, 128, 128', topOffset = 24 }) {
   return (
     <div
@@ -55,7 +74,7 @@ export function ToastStack({ toasts, onDismiss, accent = '128, 128, 128', topOff
         transform: 'translateX(-50%)',
         zIndex: 60,
         display: 'flex',
-        flexDirection: 'column-reverse', 
+        flexDirection: 'column-reverse',
         gap: 10,
         pointerEvents: 'none',
         maxWidth: 'min(440px, calc(100vw - 24px))',
@@ -71,6 +90,8 @@ export function ToastStack({ toasts, onDismiss, accent = '128, 128, 128', topOff
   );
 }
 
+/* ── Individual toast row ────────────────────────────────────── */
+
 function ToastRow({ toast, onDismiss, accent }) {
   const [mounted, setMounted] = useState(false);
   const [isExiting, setIsExiting] = useState(false);
@@ -84,7 +105,6 @@ function ToastRow({ toast, onDismiss, accent }) {
   const handleDismiss = useCallback(() => {
     if (isExiting) return;
     setIsExiting(true);
-    // Matches the duration of our master transition perfectly (320ms)
     exitTimeoutRef.current = setTimeout(() => {
       onDismiss(toast.id);
     }, 320);
@@ -105,6 +125,7 @@ function ToastRow({ toast, onDismiss, accent }) {
   const stripColor =
     toast.kind === 'success' ? '#7be191'
     : toast.kind === 'error' ? '#f37272'
+    : toast.kind === 'warning' ? '#ffc107'
     : `rgb(${accent})`;
 
   const handleAction = () => {
@@ -113,9 +134,7 @@ function ToastRow({ toast, onDismiss, accent }) {
     handleDismiss();
   };
 
-  // --- UNIFIED KINETIC STATES ---
-  // The unmounted state and the exiting state now share the exact same aesthetic coordinates,
-  // making the animation completely loopable and symmetrical.
+  /* Unified kinetic states — entrance and exit mirror each other. */
   const states = {
     initial: {
       transform: 'translateY(-40px) scale(0.88, 0.5) rotateX(-45deg)',
@@ -123,7 +142,7 @@ function ToastRow({ toast, onDismiss, accent }) {
       filter: 'blur(12px)',
       maxHeight: '100px',
       padding: '10px 14px 10px 16px',
-      gap: 12
+      gap: 12,
     },
     active: {
       transform: 'translateY(0) scale(1) rotateX(0deg)',
@@ -131,39 +150,35 @@ function ToastRow({ toast, onDismiss, accent }) {
       filter: 'blur(0px)',
       maxHeight: '100px',
       padding: '10px 14px 10px 16px',
-      gap: 12
+      gap: 12,
     },
     exit: {
-      // Pulls perfectly back up into the ceiling plane
       transform: 'translateY(-40px) scale(0.88, 0.5) rotateX(-45deg)',
       opacity: 0,
       filter: 'blur(12px)',
-      // Margins and heights collapse alongside the 3D retreat to smoothly slide up items below it
       maxHeight: '0px',
       padding: '0px 14px',
-      gap: 0
-    }
+      gap: 0,
+    },
   };
 
   const currentStyle = isExiting ? states.exit : (mounted ? states.active : states.initial);
 
-  // A beautiful, highly-damped spring curve that works perfectly both forward and backward
-  const cubicCurve = 'cubic-bezier(0.25, 1, 0.5, 1)';
+  const ease = 'cubic-bezier(0.16, 1, 0.3, 1)';
   const masterTransition = `
-    transform 0.32s ${cubicCurve}, 
-    opacity 0.28s linear, 
-    filter 0.28s ease, 
-    max-height 0.32s ${cubicCurve}, 
-    padding 0.32s ${cubicCurve},
-    gap 0.32s ${cubicCurve}
+    transform 0.32s ${ease},
+    opacity 0.28s linear,
+    filter 0.28s ease,
+    max-height 0.32s ${ease},
+    padding 0.32s ${ease},
+    gap 0.32s ${ease}
   `;
 
-  // Interior layer timings
-  const interiorTransform = isExiting 
-    ? 'translateY(-6px)' 
+  const interiorTransform = isExiting
+    ? 'translateY(-6px)'
     : (mounted ? 'translateY(0)' : 'translateY(6px)');
-  
-  const interiorTransition = `transform 0.3s ${cubicCurve}, opacity 0.25s ease`;
+
+  const interiorTransition = `transform 0.3s ${ease}, opacity 0.25s ease`;
 
   return (
     <div
@@ -171,12 +186,14 @@ function ToastRow({ toast, onDismiss, accent }) {
         pointerEvents: isExiting ? 'none' : 'auto',
         display: 'flex',
         alignItems: 'center',
-        borderRadius: 13,
-        background: 'rgba(20, 20, 22, 0.85)',
-        backdropFilter: 'blur(24px)',
-        WebkitBackdropFilter: 'blur(24px)',
-        border: isExiting ? '1px solid rgba(255,255,255,0)' : '1px solid rgba(255,255,255,0.09)',
-        boxShadow: isExiting ? '0 0px 0px rgba(0,0,0,0)' : '0 12px 36px rgba(0,0,0,0.45), 0 4px 12px rgba(0,0,0,0.25)',
+        borderRadius: 14,
+        background: 'rgba(18, 18, 20, 0.62)',
+        backdropFilter: 'blur(30px) saturate(1.6)',
+        WebkitBackdropFilter: 'blur(30px) saturate(1.6)',
+        border: isExiting ? '1px solid rgba(255,255,255,0)' : '1px solid rgba(255,255,255,0.1)',
+        boxShadow: isExiting
+          ? '0 0px 0px rgba(0,0,0,0)'
+          : '0 24px 60px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.07)',
         color: 'rgba(255,255,255,0.95)',
         fontSize: 12,
         fontWeight: 500,
@@ -184,10 +201,9 @@ function ToastRow({ toast, onDismiss, accent }) {
         minWidth: 0,
         maxWidth: '100%',
         overflow: 'hidden',
-        
         transformOrigin: 'top center',
         transition: masterTransition,
-        ...currentStyle
+        ...currentStyle,
       }}
     >
       {/* Kind indicator strip */}
@@ -196,28 +212,28 @@ function ToastRow({ toast, onDismiss, accent }) {
         background: stripColor, flexShrink: 0, marginTop: 1, marginBottom: 1,
         opacity: mounted && !isExiting ? 1 : 0,
         transform: mounted && !isExiting ? 'scaleY(1)' : 'scaleY(0.1)',
-        transition: `transform 0.3s ${cubicCurve}, opacity 0.2s ease`,
+        transition: `transform 0.3s ${ease}, opacity 0.2s ease`,
       }} />
 
-      {/* Message Text */}
-      <div style={{ 
-        flex: 1, 
+      {/* Message */}
+      <div style={{
+        flex: 1,
         minWidth: 0,
         opacity: mounted && !isExiting ? 1 : 0,
         transform: interiorTransform,
-        transition: interiorTransition
+        transition: interiorTransition,
       }}>
         {toast.message}
       </div>
 
-      {/* Action Button */}
+      {/* Action button */}
       {toast.action ? (
         <button
           type="button"
           onClick={handleAction}
           style={{
             padding: '5px 10px',
-            borderRadius: 7,
+            borderRadius: 8,
             border: '1px solid rgba(255,255,255,0.14)',
             background: 'rgba(255,255,255,0.04)',
             color: '#fff',
@@ -237,7 +253,7 @@ function ToastRow({ toast, onDismiss, accent }) {
         </button>
       ) : null}
 
-      {/* Dismiss Button */}
+      {/* Dismiss × */}
       <button
         type="button"
         onClick={handleDismiss}
@@ -254,7 +270,7 @@ function ToastRow({ toast, onDismiss, accent }) {
           flexShrink: 0,
           opacity: mounted && !isExiting ? 1 : 0,
           transform: interiorTransform,
-          transition: interiorTransition
+          transition: interiorTransition,
         }}
         onMouseEnter={(e) => { e.currentTarget.style.color = '#fff'; }}
         onMouseLeave={(e) => { e.currentTarget.style.color = 'rgba(255,255,255,0.5)'; }}

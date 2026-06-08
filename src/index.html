@@ -13,8 +13,19 @@
       overflow: hidden;
       -webkit-user-select: none;
       user-select: none;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
     }
     #root { width: 100vw; height: 100vh; }
+
+    /* Force crisp text rendering inside backdrop-filter containers.
+       Chromium can degrade text quality when backdrop-filter is active;
+       backface-visibility: hidden forces a clean compositing layer. */
+    [style*="backdrop-filter"] {
+      -webkit-backface-visibility: hidden;
+      backface-visibility: hidden;
+    }
 
     /* Custom scrollbars — thin, glass-aesthetic, fade in on hover */
     ::-webkit-scrollbar {
