@@ -13,7 +13,7 @@ import { createPortal } from 'react-dom';
  *   appliedText   — plain text of the lyrics currently applied, used to mark
  *                   which candidate (if any) is the one in use right now
  */
-export function LyricsPickerButton({ currentTrack, accent, visible, onApply, appliedText }) {
+export function LyricsPickerButton({ currentTrack, accent, visible, onApply, appliedText, appliedId }) {
   const [open, setOpen] = useState(false);
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -55,6 +55,24 @@ export function LyricsPickerButton({ currentTrack, accent, visible, onApply, app
     .toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
   const appliedSig = sigOf(appliedText);
   const targetSec = Number(currentTrack?.duration) || 0;
+  // Exactly one row is ever "applied". Prefer an exact LRCLIB id match; if we
+  // don't know the id (auto-fetched lyrics), fall back to the words-signature
+  // but choose a single winner (closest duration) so multiple near-identical
+  // versions of the same song don't all light up — and switching works.
+  const appliedIndex = (() => {
+    if (appliedId != null) {
+      const byId = results.findIndex((c) => c.id != null && String(c.id) === String(appliedId));
+      if (byId >= 0) return byId;
+    }
+    if (!appliedSig) return -1;
+    let best = -1; let bestDelta = Infinity;
+    results.forEach((c, i) => {
+      if (sigOf(c.syncedLyrics || c.plainLyrics || '') !== appliedSig) return;
+      const d = (targetSec > 0 && c.duration > 0) ? Math.abs(c.duration - targetSec) : 1e9;
+      if (d < bestDelta) { bestDelta = d; best = i; }
+    });
+    return best;
+  })();
   const matchColor = (absDelta) => {
     if (absDelta == null) return 'rgba(255,255,255,0.45)';
     if (absDelta <= 2) return '#5fd08a';
@@ -136,8 +154,7 @@ export function LyricsPickerButton({ currentTrack, accent, visible, onApply, app
               ) : (
                 results.map((c, i) => {
                   const durStr = c.duration ? `${Math.floor(c.duration / 60)}:${String(Math.floor(c.duration % 60)).padStart(2, '0')}` : '';
-                  const candSig = sigOf(c.syncedLyrics || c.plainLyrics || '');
-                  const isApplied = !!appliedSig && !!candSig && candSig === appliedSig;
+                  const isApplied = i === appliedIndex;
                   const absDelta = targetSec > 0 && c.duration > 0 ? Math.abs(c.duration - targetSec) : null;
                   return (
                     <div key={c.id || i}

@@ -10,6 +10,7 @@ function CoverFullscreenOverlay({
   isPlaying = false, currentTime = 0, duration = 0,
   shuffleOn = false, repeat = 'off',
   volume = 1, onSetVolume,
+  nowPlayingSliderStyle = 'circle',
   onTogglePlay, onPrev, onNext, onSeek, onToggleShuffle, onToggleRepeat,
   lyricsData = null, hasSyncedLyrics = false, hasPlainLyrics = false,
   onClose,
@@ -162,7 +163,7 @@ function CoverFullscreenOverlay({
       {/* Seek */}
       <div style={{ width: '100%', maxWidth: 380, marginTop: 20, display: 'flex', alignItems: 'center', gap: 9 }}>
         <span style={{ color: 'rgba(255,255,255,0.55)', fontSize: 10, fontVariantNumeric: 'tabular-nums', minWidth: 32, textAlign: 'right' }}>{formatTime(currentTime)}</span>
-        <HeartSlider value={currentTime} max={duration || 0} onChange={(v) => onSeek?.(v)} accent={accent} ariaLabel="Seek" thumbSize={12} />
+        <HeartSlider value={currentTime} max={duration || 0} onChange={(v) => onSeek?.(v)} accent={accent} ariaLabel="Seek" thumbSize={12} thumbShape={nowPlayingSliderStyle} />
         <span style={{ color: 'rgba(255,255,255,0.55)', fontSize: 10, fontVariantNumeric: 'tabular-nums', minWidth: 32 }}>{formatTime(duration)}</span>
       </div>
 
@@ -218,7 +219,7 @@ function CoverFullscreenOverlay({
               </svg>
             )}
           </button>
-          <HeartSlider value={volume} max={1} onChange={(v) => onSetVolume?.(v)} accent={accent} ariaLabel="Volume" thumbSize={11} />
+          <HeartSlider value={volume} max={1} onChange={(v) => onSetVolume?.(v)} accent={accent} ariaLabel="Volume" thumbSize={11} thumbShape={nowPlayingSliderStyle} />
         </div>
       ) : null}
       </div>

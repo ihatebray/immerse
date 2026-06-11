@@ -113,6 +113,7 @@ import {
 } from './soulseekClient.js';
 import { resolveCoverFilePath, mimeForCoverPath } from './coverArtStore.js';
 import * as discordPresence from './discordPresence.js';
+import * as twitchOverlay from './twitchOverlay.js';
 import { resolveForDiscord as resolveImgurCover } from './coverUploader.js';
 
 protocol.registerSchemesAsPrivileged([
@@ -984,6 +985,31 @@ ipcMain.handle('discord:setActivity', async (event, payload) => {
 
 ipcMain.handle('discord:status', async () => {
   return discordPresence.status();
+});
+
+// ── Stream overlay (OBS browser source) ────────────────────────────
+// Wires the local now-playing overlay server (twitchOverlay.js) to the
+// renderer. Without these handlers api.twitchOverlay* is undefined, so the
+// Settings toggle could never turn on. start/status return { ok, running?, url }.
+ipcMain.handle('twitch:start', async () => {
+  try { return await twitchOverlay.start(); }
+  catch (e) { return { ok: false, error: String(e?.message || e) }; }
+});
+ipcMain.handle('twitch:stop', async () => {
+  try { return twitchOverlay.stop(); }
+  catch (e) { return { ok: false, error: String(e?.message || e) }; }
+});
+ipcMain.handle('twitch:status', async () => {
+  try { return twitchOverlay.status(); }
+  catch (e) { return { ok: false, running: false, url: '', error: String(e?.message || e) }; }
+});
+ipcMain.handle('twitch:setOptions', async (_e, opts) => {
+  try { return twitchOverlay.setOptions(opts || {}); }
+  catch (e) { return { ok: false, error: String(e?.message || e) }; }
+});
+ipcMain.handle('twitch:setNowPlaying', async (_e, payload) => {
+  try { return twitchOverlay.setNowPlaying(payload ?? null); }
+  catch (e) { return { ok: false, error: String(e?.message || e) }; }
 });
 
 /**
@@ -3893,6 +3919,29 @@ async function itunesLookupArtistAlbums(artistId, limit = 25) {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+/**
+ * Run an async mapper over a list with a bounded number of workers in flight,
+ * preserving input order. This is the main refresh speed-up: followed artists
+ * are fetched several at a time instead of strictly one-after-another, so total
+ * time no longer scales linearly with how many artists you follow. Each call
+ * still goes through fetchJsonWithRetry, so Apple throttling is handled by
+ * backoff rather than a blanket inter-request delay.
+ */
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < items.length) {
+      const idx = cursor++;
+      results[idx] = await fn(items[idx], idx);
+    }
+  }
+  const n = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: n }, () => worker()));
+  return results;
+}
+const RELEASES_REFRESH_CONCURRENCY = 5;
+
 // ---------------------------------------------------------------------------
 // Apple charts + artist search — backs the homepage charts (WelcomeScreen) and
 // the follow-artist picker (NewReleasesTab). Apple's search endpoint throttles
@@ -4053,6 +4102,93 @@ ipcMain.handle('artists:searchCandidates', async (_e, q) => {
   }
 });
 
+// Per-artist info cache (genre / latest year / release count / artwork), keyed
+// by iTunes artist id, so the Followed-artists list doesn't re-hit iTunes on
+// every open.
+const artistInfoCache = new Map(); // artistId -> { at, data }
+const ARTIST_INFO_TTL_MS = 12 * 60 * 60 * 1000; // 12h
+
+/**
+ * Look up display info for a set of followed artists, regardless of whether
+ * they have a release in the recent-releases cache. Input: an array of
+ * { name, itunesArtistId }. Resolves any missing IDs by name, then batches
+ * album lookups to compute genre, latest release year, release count and cover
+ * art. Returns { ok, info } keyed by lowercased artist name.
+ */
+ipcMain.handle('artists:info', async (_e, artists) => {
+  try {
+    const list = Array.isArray(artists) ? artists : [];
+    if (!list.length) return { ok: true, info: {} };
+
+    // Resolve each artist to an iTunes id (use the pinned id when present).
+    const resolved = []; // { key, id }
+    for (const a of list) {
+      const name = String(a?.name || '').trim();
+      if (!name) continue;
+      const key = name.toLowerCase();
+      let id = Number(a?.itunesArtistId) || null;
+      if (!id) {
+        try {
+          const params = new URLSearchParams({ term: name, entity: 'musicArtist', limit: '1', media: 'music' });
+          const j = await fetchJsonWithRetry(`${ITUNES_API}/search?${params}`);
+          const r = (Array.isArray(j?.results) ? j.results : [])[0];
+          if (r?.artistId) id = r.artistId;
+        } catch { /* skip — leave this artist without info */ }
+      }
+      if (id) resolved.push({ key, id });
+    }
+    if (!resolved.length) return { ok: true, info: {} };
+
+    const info = {};
+    const need = []; // ids not in cache
+    for (const r of resolved) {
+      const c = artistInfoCache.get(r.id);
+      if (c && Date.now() - c.at < ARTIST_INFO_TTL_MS) { info[r.key] = c.data; }
+      else need.push(r);
+    }
+
+    // Batch the uncached ids (chunks of 20) into album lookups.
+    for (let i = 0; i < need.length; i += 20) {
+      const chunk = need.slice(i, i + 20);
+      const ids = chunk.map((c) => c.id).join(',');
+      try {
+        const lk = await fetchJsonWithRetry(`${ITUNES_API}/lookup?id=${ids}&entity=album&limit=200&sort=recent`);
+        const byArtist = new Map();
+        const artistGenre = new Map();
+        for (const row of (Array.isArray(lk?.results) ? lk.results : [])) {
+          if (row.wrapperType === 'artist') { artistGenre.set(row.artistId, row.primaryGenreName || ''); continue; }
+          if (row.wrapperType !== 'collection') continue;
+          const arr = byArtist.get(row.artistId) || [];
+          arr.push(row);
+          byArtist.set(row.artistId, arr);
+        }
+        for (const c of chunk) {
+          const al = byArtist.get(c.id) || [];
+          let data;
+          if (!al.length) {
+            data = { genre: artistGenre.get(c.id) || '', latestYear: 0, releaseCount: 0, artworkUrl: '' };
+          } else {
+            al.sort((x, y) => (Date.parse(y.releaseDate || '') || 0) - (Date.parse(x.releaseDate || '') || 0));
+            const yr = new Date(al[0].releaseDate || 0).getFullYear();
+            data = {
+              genre: al[0].primaryGenreName || artistGenre.get(c.id) || '',
+              latestYear: yr > 1900 ? yr : 0,
+              releaseCount: al.length,
+              artworkUrl: upscaleArtwork(al[0].artworkUrl100 || al[0].artworkUrl60, 120),
+            };
+          }
+          artistInfoCache.set(c.id, { at: Date.now(), data });
+          info[c.key] = data;
+        }
+      } catch { /* skip this chunk; those artists just stay bare */ }
+    }
+
+    return { ok: true, info };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
 /**
  * Refresh releases for a list of artist names. Resolves each artist's iTunes
  * ID on first call (and caches it), then fetches their recent albums and
@@ -4063,24 +4199,26 @@ ipcMain.handle('artists:searchCandidates', async (_e, q) => {
  * @returns           - { upserted, failures, resolved } for debugging
  */
 async function refreshReleasesForArtists(artistNames, knownIds) {
-  const allReleases = [];
   const failures = [];
   const resolved = [];
   const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
 
   console.log('[releases] refresh starting for', artistNames.length, 'artists');
 
-  for (const name of artistNames) {
+  // Per-artist work, run several at a time via mapWithConcurrency. Returns a
+  // partial result rather than throwing, so one artist's failure can't abort
+  // the batch.
+  async function processArtist(name) {
+    const out = { releases: [], resolvedEntry: null, failure: null };
     try {
       let itunesArtistId = knownIds.get(name.toLowerCase()) ?? null;
       let wasResolved = false;
       if (!itunesArtistId) {
         const artist = await itunesSearchArtist(name);
-        await sleep(ITUNES_RATE_DELAY_MS);
         if (!artist?.artistId) {
           console.log(`[releases]   "${name}" → NOT FOUND on iTunes`);
-          failures.push({ name, reason: 'not found on iTunes' });
-          continue;
+          out.failure = { name, reason: 'not found on iTunes' };
+          return out;
         }
         itunesArtistId = Number(artist.artistId);
         wasResolved = true;
@@ -4088,17 +4226,15 @@ async function refreshReleasesForArtists(artistNames, knownIds) {
         await setItunesArtistIdForArtist(name, itunesArtistId);
       }
       const albums = await itunesLookupArtistAlbums(itunesArtistId, 25);
-      await sleep(ITUNES_RATE_DELAY_MS);
       let recentCount = 0;
       for (const a of albums) {
         const releaseDate = String(a.releaseDate || '');
         const releaseMs = releaseDate ? new Date(releaseDate).getTime() : 0;
-        const isRecent = releaseMs >= cutoff;
-        if (isRecent) recentCount += 1;
+        if (releaseMs >= cutoff) recentCount += 1;
         // Normalise artwork URL to 600x600 (the API returns 100x100 by default)
         const art100 = String(a.artworkUrl100 || '');
         const art600 = art100.replace(/100x100bb\.jpg$/i, '600x600bb.jpg');
-        allReleases.push({
+        out.releases.push({
           itunesArtistId,
           collectionId: Number(a.collectionId),
           collectionName: String(a.collectionName || ''),
@@ -4110,13 +4246,7 @@ async function refreshReleasesForArtists(artistNames, knownIds) {
           primaryGenreName: String(a.primaryGenreName || ''),
         });
       }
-      resolved.push({
-        name,
-        itunesArtistId,
-        albumCount: albums.length,
-        recentCount,
-        resolvedThisRun: wasResolved,
-      });
+      out.resolvedEntry = { name, itunesArtistId, albumCount: albums.length, recentCount, resolvedThisRun: wasResolved };
       if (recentCount > 0) {
         console.log(`[releases]   "${name}" → ${albums.length} albums total, ${recentCount} in last 30d`);
       } else if (albums.length === 0) {
@@ -4124,9 +4254,20 @@ async function refreshReleasesForArtists(artistNames, knownIds) {
       }
     } catch (e) {
       console.error('[releases] fetch failed for', name, e?.message || e);
-      failures.push({ name, reason: String(e?.message || e) });
+      out.failure = { name, reason: String(e?.message || e) };
     }
+    return out;
   }
+
+  const outcomes = await mapWithConcurrency(artistNames, RELEASES_REFRESH_CONCURRENCY, processArtist);
+
+  const allReleases = [];
+  for (const o of outcomes) {
+    if (o.releases.length) allReleases.push(...o.releases);
+    if (o.resolvedEntry) resolved.push(o.resolvedEntry);
+    if (o.failure) failures.push(o.failure);
+  }
+
   if (allReleases.length) {
     await upsertArtistReleases(allReleases);
   }
@@ -4204,8 +4345,8 @@ ipcMain.handle('releases:loadOverrides', async () => {
   }
 });
 
-ipcMain.handle('releases:addArtist', async (event, artistName) => {
-  try { return await addFollowedArtist(artistName); }
+ipcMain.handle('releases:addArtist', async (event, artistName, itunesArtistId = null) => {
+  try { return await addFollowedArtist(artistName, itunesArtistId); }
   catch (e) { return { ok: false, error: String(e?.message || e) }; }
 });
 
@@ -4255,6 +4396,11 @@ ipcMain.handle('releases:lookupAlbumTracks', async (event, collectionId) => {
           trackNumber: Number(r.trackNumber) || 0,
           trackTimeMillis: Number(r.trackTimeMillis) || 0,
           artworkUrl: String(r.artworkUrl100 || '').replace(/100x100bb\.jpg$/i, '600x600bb.jpg'),
+          previewUrl: String(r.previewUrl || ''), // 30s m4a clip from iTunes, for in-app preview
+          // iTunes omits/false-flags isStreamable on tracks that aren't released
+          // yet (e.g. unreleased songs on a pre-order album). Treat missing as
+          // available; only an explicit false means "not yet available".
+          isStreamable: r.isStreamable !== false,
           explicit,
         };
       })

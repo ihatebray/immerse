@@ -437,6 +437,10 @@ function SettingsTab({
   onSetHiddenTabIds,
   dockCollapseAnimationEnabled = false,
   onSetDockCollapseAnimationEnabled,
+  previewVolumePosition = 'bottomRight',
+  onSetPreviewVolumePosition,
+  nowPlayingSliderStyle = 'circle',
+  onSetNowPlayingSliderStyle,
   randomButtonEnabled = false,
   onSetRandomButtonEnabled,
   breathingDockPillEnabled = false,
@@ -659,6 +663,11 @@ function SettingsTab({
       else localStorage.removeItem('immerse:allowMusicVideo');
     }
   };
+
+  const updatePreviewVolumePosition = (v) => {
+    onSetPreviewVolumePosition?.(v);
+  };
+
 
   // Load existing creds when this tab mounts.
   useEffect(() => {
@@ -985,6 +994,19 @@ function SettingsTab({
           checked={edgeBleedEnabled}
           onChange={(v) => onSetEdgeBleedEnabled?.(v)}
         />
+        <SegmentedSettingRow
+          label="Slider Thumb Style"
+          options={[
+            { value: 'circle', label: 'Circle' },
+            { value: 'heart', label: 'Heart' },
+          ]}
+          value={nowPlayingSliderStyle}
+          onChange={(v) => onSetNowPlayingSliderStyle?.(v)}
+          descriptions={{
+            circle: 'The seek and volume sliders use a simple circle thumb.',
+            heart: 'The seek and volume sliders use the signature heart thumb.',
+          }}
+        />
         <AmbientSettingRow
           mode={ambientMode}
           onSetMode={onSetAmbientMode}
@@ -1015,6 +1037,26 @@ function SettingsTab({
           description="When nothing cleaner turns up, fall back to a music video that’s an exact length match — same studio audio, just from the video. Off by default."
           checked={allowMusicVideo}
           onChange={updateAllowMusicVideo}
+        />
+      </Section>
+
+      {/* New Releases */}
+      <Section title="New Releases" category="playback">
+        <div style={{ fontSize: 10.5, color: 'rgba(255,255,255,0.55)', lineHeight: 1.55, marginBottom: 10 }}>
+          Previewing 30-second clips of releases from artists you follow.
+        </div>
+        <SegmentedSettingRow
+          label="Preview Volume Position"
+          options={[
+            { value: 'bottomRight', label: 'Bottom right' },
+            { value: 'underButtons', label: 'Under buttons' },
+          ]}
+          value={previewVolumePosition}
+          onChange={updatePreviewVolumePosition}
+          descriptions={{
+            bottomRight: 'A floating volume pill sits in the bottom-right corner while a preview plays.',
+            underButtons: 'A small volume bar appears inline, under the preview and download buttons.',
+          }}
         />
       </Section>
 
@@ -1584,18 +1626,31 @@ function Section({ title, category, children }) {
     const filtered = [];
     React.Children.forEach(children, (child) => {
       if (!React.isValidElement(child)) return;
-      const isToggle = child.type === ToggleRow;
-      if (isToggle) {
-        const label = String(child.props.label || '').toLowerCase();
-        const desc = String(child.props.description || '').toLowerCase();
-        if (label.includes(query) || desc.includes(query)) {
-          filtered.push(child);
-        }
+      // Build a searchable haystack from the props that setting rows expose:
+      // ToggleRow has label/description, SegmentedSettingRow additionally has
+      // per-option descriptions and option labels. Components without those
+      // props can still opt in by declaring a static `searchTerms` string
+      // (see AmbientSettingRow / TransitionSettingRow below their bodies).
+      const p = child.props || {};
+      const parts = [];
+      if (typeof p.label === 'string') parts.push(p.label);
+      if (typeof p.description === 'string') parts.push(p.description);
+      if (p.descriptions && typeof p.descriptions === 'object') {
+        parts.push(Object.values(p.descriptions).filter((v) => typeof v === 'string').join(' '));
       }
-      // Non-ToggleRow children (FontPicker, LastFmKeyField, plain divs,
-      // headings, etc.) are skipped during search. They'll come back
-      // automatically if the user matches the section title or clears
-      // the query.
+      if (Array.isArray(p.options)) {
+        parts.push(p.options.map((o) => (o && typeof o.label === 'string' ? o.label : '')).join(' '));
+      }
+      if (child.type && typeof child.type.searchTerms === 'string') {
+        parts.push(child.type.searchTerms);
+      }
+      const haystack = parts.join(' ').toLowerCase();
+      if (haystack && haystack.includes(query)) {
+        filtered.push(child);
+      }
+      // Children with no searchable text (FontPicker, plain divs, headings,
+      // etc.) are skipped during search. They'll come back automatically if
+      // the user matches the section title or clears the query.
     });
     childrenToRender = filtered;
     hasVisibleChildren = filtered.length > 0;
@@ -2768,6 +2823,67 @@ function ToggleRow({ label, description, checked, onChange }) {
  * don't re-validate here (uncontrolled feel is nicer than clamping
  * mid-typing). The setter handles out-of-range inputs at save time.
  */
+/**
+ * SegmentedSettingRow — shared card for multiple-choice settings. Mirrors the
+ * AmbientSettingRow / TransitionSettingRow visual language: a labelled card
+ * with a contextual description and a segmented control. `descriptions` is an
+ * optional map of value → text; when given, the subtext updates with the
+ * selection (falling back to `description` for a static line).
+ */
+function SegmentedSettingRow({ label, description, descriptions, options = [], value, onChange }) {
+  const subtext = (descriptions && descriptions[value]) || description || null;
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column', gap: 10,
+      padding: '12px 11px', borderRadius: 10,
+      background: 'rgba(255,255,255,0.03)',
+      border: '1px solid rgba(255,255,255,0.06)',
+    }}>
+      <div>
+        <div style={{ fontSize: 12, fontWeight: 600, color: 'rgba(255,255,255,0.9)', lineHeight: 1.2 }}>
+          {label}
+        </div>
+        {subtext ? (
+          <div style={{ fontSize: 10.5, color: 'rgba(255,255,255,0.45)', lineHeight: 1.45, marginTop: 3 }}>
+            {subtext}
+          </div>
+        ) : null}
+      </div>
+
+      {/* Segmented control */}
+      <div style={{
+        display: 'flex', gap: 4, padding: 3,
+        background: 'rgba(0,0,0,0.25)', borderRadius: 8,
+      }}>
+        {options.map((opt) => {
+          const active = value === opt.value;
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              onClick={() => onChange?.(opt.value)}
+              style={{
+                flex: 1,
+                padding: '6px 8px',
+                borderRadius: 6,
+                border: 'none',
+                background: active ? 'rgba(255,255,255,0.14)' : 'transparent',
+                color: active ? '#fff' : 'rgba(255,255,255,0.55)',
+                fontSize: 11.5,
+                fontWeight: active ? 600 : 500,
+                cursor: 'pointer',
+                transition: 'background 0.15s, color 0.15s',
+              }}
+            >
+              {opt.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function AmbientSettingRow({ mode, onSetMode, customDelaySec, onSetCustomDelaySec }) {
   const options = [
     { value: 'off',    label: 'Off' },
@@ -2888,6 +3004,9 @@ function AmbientSettingRow({ mode, onSetMode, customDelaySec, onSetCustomDelaySe
  *   crossfade → next track starts `crossfadeSec` early and the two overlap
  *               while one fades down and the other fades up
  */
+AmbientSettingRow.searchTerms = 'ambient mode screensaver idle collage cover delay off strict relaxed custom';
+TransitionSettingRow.searchTerms = 'track transitions crossfade gapless hard cut fade between songs';
+
 function TransitionSettingRow({ mode, onSetMode, crossfadeSec, onSetCrossfadeSec }) {
   const options = [
     { value: 'off',       label: 'Off' },

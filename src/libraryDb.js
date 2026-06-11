@@ -1243,6 +1243,10 @@ export async function excludeFollowedArtist(artistName) {
        ON CONFLICT(artist_name) DO UPDATE SET action='exclude';`,
       [name, Date.now()],
     );
+    // Drop their cached releases too, so they stop showing in the New Releases
+    // tab / welcome screen immediately (the tab also filters by followed set,
+    // but this keeps the cache from carrying stale rows).
+    try { db.run('DELETE FROM artist_releases_cache WHERE artist_name = ? COLLATE NOCASE;', [name]); } catch { /* non-fatal */ }
     persistAtomic();
     return { ok: true };
   } catch (e) {

@@ -1,5 +1,16 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 
+// "Do I already own this song" matching — title + primary artist, since iTunes
+// metadata rarely shares IDs with imported library tracks.
+const normTrackTitle = (s) => (s || '').toLowerCase().trim()
+  .replace(/\s*\((?:feat|ft|with)\.?[^)]*\)/gi, '')
+  .replace(/\s*-\s*(?:feat|ft)\.?.*$/i, '')
+  .trim();
+const primaryArtistOf = (s) => (s || '').toLowerCase()
+  .split(/,|&|\bfeat\.?|\bft\.?/i)[0].trim();
+const libTrackKey = (title, artist) => `${normTrackTitle(title)}|${primaryArtistOf(artist)}`;
+const normAlbum = (s) => (s || '').toLowerCase().trim().replace(/\s*-\s*(?:single|ep)$/i, '').trim();
+
 const EXPLORE_CSS = `
   .xp-scroll * { box-sizing: border-box; }
   .xp-scroll::-webkit-scrollbar { width: 10px; }
@@ -217,11 +228,37 @@ function WelcomeScreen({
   onPlayTrack,
   accent = '48, 48, 48',
   onSpotifyImportDone,
+  onPreviewPlay,
   followedReleases = [],
   trackOfMomentEnabled = false,
   playEvents = [],
 }) {
   const isEmpty = library.length === 0;
+
+  // Fast "already in library" lookup by title + primary artist.
+  const libraryTrackKeys = useMemo(() => {
+    const set = new Set();
+    for (const t of library) { if (t?.title) set.add(libTrackKey(t.title, t.artist)); }
+    return set;
+  }, [library]);
+  const trackInLibrary = useCallback((title, artist) => libraryTrackKeys.has(libTrackKey(title, artist)), [libraryTrackKeys]);
+
+  // Whole-album ownership without fetching the tracklist (count owned vs trackCount).
+  const albumOwnedCounts = useMemo(() => {
+    const m = new Map();
+    for (const t of library) {
+      if (!t?.album) continue;
+      const k = `${normAlbum(t.album)}|${primaryArtistOf(t.artist)}`;
+      m.set(k, (m.get(k) || 0) + 1);
+    }
+    return m;
+  }, [library]);
+  const releaseFullyOwned = useCallback((a) => {
+    const tc = Number(a?.trackCount) || 0;
+    if (tc <= 1) return trackInLibrary((a?.name || '').replace(/\s*-\s*single$/i, ''), a?.artistName);
+    const k = `${normAlbum(a?.name)}|${primaryArtistOf(a?.artistName)}`;
+    return (albumOwnedCounts.get(k) || 0) >= tc;
+  }, [albumOwnedCounts, trackInLibrary]);
 
   // Derive simple library stats — albums are unique album+primary-artist pairs
   const albumCount = useMemo(() => {
@@ -364,7 +401,6 @@ function WelcomeScreen({
   // { id, name, artistName, artworkUrl, releaseDate, genre, itemType }.
   const followedNewReleases = useMemo(() => {
     if (!Array.isArray(followedReleases) || followedReleases.length === 0) return [];
-    const now = Date.now();
     const normName = (s) => (s || '').toLowerCase()
       .replace(/\s*[([][^)\]]*(explicit|clean|deluxe|edition|version|remaster[^)\]]*)[^)\]]*[)\]]/gi, '')
       .replace(/\s*-\s*(single|ep|explicit|clean)\s*$/gi, '').replace(/\s+/g, ' ').trim();
@@ -374,8 +410,8 @@ function WelcomeScreen({
     const noId = [];
     for (const r of followedReleases) {
       if (!r) continue;
-      const ms = Date.parse(r.releaseDate || '') || 0;
-      if (ms && ms > now + 12 * 60 * 60 * 1000) continue;
+      // Show upcoming releases too (no future-date filtering). Tracks that
+      // aren't available yet are made non-downloadable in the tracklist.
       const id = Number(r.collectionId);
       if (Number.isFinite(id) && id > 0) {
         const p = byId.get(id);
@@ -404,13 +440,56 @@ function WelcomeScreen({
         artworkUrl: r.artworkUrl || '',
         releaseDate: r.releaseDate || '',
         genre: r.primaryGenreName || '',
+        trackCount: Number(r.trackCount) || 0,
         itemType: (Number(r.trackCount) === 1) ? 'single' : 'album',
       }));
   }, [followedReleases]);
   const [songsExpanded, setSongsExpanded] = useState(false);
+  const [releasesExpanded, setReleasesExpanded] = useState(false);
   const [albumTracksCache, setAlbumTracksCache] = useState({}); // {id: track[]}
   const [albumLoading, setAlbumLoading] = useState({});
   const [albumError, setAlbumError] = useState({});
+
+  // 30-second iTunes preview playback for new-release tracks. One at a time.
+  const [previewKey, setPreviewKey] = useState(null); // `${albumId}:${trackId}`
+  const [previewIsSingle, setPreviewIsSingle] = useState(false);
+  const previewAudioRef = useRef(null);
+  const togglePreview = useCallback((album, tk, isSingle = false) => {
+    const url = tk?.previewUrl;
+    if (!url) return;
+    const audio = previewAudioRef.current;
+    if (!audio) return;
+    const k = `${album.id}:${tk.trackId}`;
+    if (previewKey === k) { try { audio.pause(); } catch { /* */ } setPreviewKey(null); return; }
+    onPreviewPlay?.();
+    try {
+      audio.src = url; audio.currentTime = 0; audio.volume = 0.9;
+      audio.play().then(() => { setPreviewKey(k); setPreviewIsSingle(isSingle); }).catch(() => setPreviewKey(null));
+    } catch { setPreviewKey(null); }
+  }, [previewKey, onPreviewPlay]);
+  // Single/one-song preview: fetch its track (once) to get the preview clip.
+  const toggleSinglePreview = useCallback(async (a) => {
+    const id = Number(a?.id);
+    let tks = albumTracksCache[id];
+    if (!Array.isArray(tks)) {
+      const api = typeof window !== 'undefined' ? window.electronAPI : null;
+      if (!api?.lookupReleaseAlbumTracks) return;
+      try {
+        const res = await api.lookupReleaseAlbumTracks(id);
+        if (res?.ok && Array.isArray(res.tracks)) { tks = res.tracks; setAlbumTracksCache((m) => ({ ...m, [id]: res.tracks })); }
+      } catch { return; }
+    }
+    const tk = Array.isArray(tks) ? tks[0] : null;
+    if (tk?.previewUrl) togglePreview(a, tk, true);
+  }, [albumTracksCache, togglePreview]);
+  // Stop preview when its album collapses (albums only — singles aren't expanded), and on unmount.
+  useEffect(() => {
+    if (previewKey && !previewIsSingle && !String(previewKey).startsWith(`${expandedAlbumId}:`)) {
+      try { previewAudioRef.current?.pause(); } catch { /* */ }
+      setPreviewKey(null);
+    }
+  }, [expandedAlbumId, previewKey, previewIsSingle]);
+  useEffect(() => () => { try { previewAudioRef.current?.pause(); } catch { /* */ } }, []);
 
   const toggleAlbum = useCallback((album) => {
     const id = Number(album?.id);
@@ -450,10 +529,12 @@ function WelcomeScreen({
     const tracks = albumTracksCache[Number(album.id)];
     if (!Array.isArray(tracks) || !tracks.length) return;
     for (const tk of tracks) {
+      if (tk.isStreamable === false) continue; // not released yet — skip
+      if (trackInLibrary(tk.trackName, tk.artistName || album.artistName)) continue; // already owned
       // eslint-disable-next-line no-await-in-loop
       await downloadAlbumTrack(album, tk);
     }
-  }, [albumTracksCache, downloadAlbumTrack]);
+  }, [albumTracksCache, downloadAlbumTrack, trackInLibrary]);
 
   // Time-of-day greeting for the hero read-line.
   const greeting = useMemo(() => {
@@ -746,6 +827,9 @@ function WelcomeScreen({
     }}>
       <style>{EXPLORE_CSS}</style>
 
+      {/* Hidden element that plays the 30s iTunes preview clips */}
+      <audio ref={previewAudioRef} preload="none" onEnded={() => setPreviewKey(null)} />
+
       <div className="xp-inner" style={{ position: 'relative', zIndex: 1, maxWidth: 1080, margin: '0 auto' }}>
         {/* Header */}
         <div className="xp-head">
@@ -806,32 +890,52 @@ function WelcomeScreen({
             </div>
           ) : (
             <div className="xp-rel-list">
-              {followedNewReleases.map((a) => {
+              {(releasesExpanded ? followedNewReleases : followedNewReleases.slice(0, 6)).map((a) => {
                 const isSingle = a.itemType === 'single';
                 const open = expandedAlbumId === Number(a.id);
                 const sdKey = `song:${a.id}`;
                 const sdState = dlState[sdKey];
+                const fullyOwned = releaseFullyOwned(a);
+                const expandable = !isSingle && !fullyOwned;
+                const singlePrev = !!previewKey && String(previewKey).startsWith(`${a.id}:`);
                 const tracks = albumTracksCache[Number(a.id)];
                 const loading = albumLoading[Number(a.id)];
                 const err = albumError[Number(a.id)];
                 return (
                   <div key={a.id} className={`xp-rel${open ? ' open' : ''}`} style={{ '--acc': accent }}>
-                    <button type="button" className="xp-rel-row"
-                      onClick={() => { if (isSingle) { if (!sdState || sdState === 'failed') downloadChartSong(a); } else toggleAlbum(a); }}
-                      aria-expanded={isSingle ? undefined : open}>
+                    <div className="xp-rel-row" role={expandable ? 'button' : undefined}
+                      onClick={expandable ? () => toggleAlbum(a) : undefined}
+                      aria-expanded={expandable ? open : undefined}
+                      style={{ cursor: expandable ? 'pointer' : 'default' }}>
                       <span className="xp-rel-cov" style={{ backgroundImage: a.artworkUrl ? `url(${a.artworkUrl})` : 'none' }} />
                       <span className="xp-rel-meta">
                         <span className="xp-rel-t">{a.name}<span className={`xp-rel-tag${isSingle ? ' single' : ''}`}>{isSingle ? 'Single' : 'Album'}</span></span>
-                        <span className="xp-rel-a">{a.artistName}{a.releaseDate ? ` · ${new Date(a.releaseDate).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}` : ''}{!isSingle && a.itemType === 'album' ? '' : ''}</span>
+                        <span className="xp-rel-a">{a.artistName}{a.releaseDate ? ` · ${new Date(a.releaseDate).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}` : ''}</span>
                       </span>
-                      <span className={`xp-rel-act${(isSingle && sdState) ? ` ${sdState}` : ''}`}>
-                        {isSingle ? dlIcon(sdState) : (
+                      {fullyOwned ? (
+                        <span className="xp-dl" aria-label="In library" title="Already in your library" style={{ color: '#8ae08a', cursor: 'default' }}>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+                        </span>
+                      ) : isSingle ? (
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                          <button type="button" className="xp-dl" aria-label="Preview" title={singlePrev ? 'Stop preview' : 'Preview (30s)'}
+                            onClick={(e) => { e.stopPropagation(); toggleSinglePreview(a); }}
+                            style={singlePrev ? { background: `rgba(${accent},0.85)` } : undefined}>
+                            {singlePrev
+                              ? <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1" /><rect x="14" y="5" width="4" height="14" rx="1" /></svg>
+                              : <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>}
+                          </button>
+                          <button type="button" className={`xp-dl${sdState ? ` ${sdState}` : ''}`} aria-label="Download" title={sdState || 'Download'}
+                            onClick={(e) => { e.stopPropagation(); if (!sdState || sdState === 'failed') downloadChartSong(a); }}>{dlIcon(sdState)}</button>
+                        </span>
+                      ) : (
+                        <span className="xp-rel-act">
                           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style={{ transform: open ? 'rotate(180deg)' : 'none', transition: 'transform .25s' }}><path d="M6 9l6 6 6-6" /></svg>
-                        )}
-                      </span>
-                    </button>
+                        </span>
+                      )}
+                    </div>
 
-                    {!isSingle && open ? (
+                    {expandable && open ? (
                       <div className="xp-rel-panel">
                         <div className="xp-rel-panel-bar">
                           <button type="button" className="xp-ap-all" onClick={(e) => { e.stopPropagation(); downloadWholeAlbum(a); }}>
@@ -846,14 +950,38 @@ function WelcomeScreen({
                               : tracks && tracks.length ? tracks.map((tk, ti) => {
                                 const key = `atrk:${a.id}:${tk.trackId}`;
                                 const st = dlState[key];
+                                const isPrev = previewKey === `${a.id}:${tk.trackId}`;
+                                const unavailable = tk.isStreamable === false;
+                                const inLib = trackInLibrary(tk.trackName, tk.artistName || a.artistName);
                                 return (
-                                  <div key={tk.trackId || ti} className="xp-ap-row">
+                                  <div key={tk.trackId || ti} className="xp-ap-row" style={unavailable ? { opacity: 0.5 } : undefined}>
                                     <span className="xp-ap-n">{tk.trackNumber || ti + 1}</span>
                                     <span className="xp-ap-tn">{tk.trackName}</span>
                                     {tk.explicit ? <span className="xp-ap-e">E</span> : null}
+                                    {unavailable ? <span className="xp-ap-e" style={{ borderColor: 'rgba(255,255,255,0.18)' }}>SOON</span> : null}
                                     <span className="xp-ap-dur">{fmtDur(tk.trackTimeMillis)}</span>
-                                    <button type="button" className={`xp-dl${st ? ` ${st}` : ''}`} aria-label="Download" title={st || 'Download'}
-                                      onClick={(e) => { e.stopPropagation(); if (!st || st === 'failed') downloadAlbumTrack(a, tk); }}>{dlIcon(st)}</button>
+                                    {tk.previewUrl ? (
+                                      <button type="button" className="xp-dl" aria-label={isPrev ? 'Stop preview' : 'Play preview'} title={isPrev ? 'Stop preview' : 'Preview (30s)'}
+                                        onClick={(e) => { e.stopPropagation(); togglePreview(a, tk); }}
+                                        style={isPrev ? { background: `rgba(${accent},0.85)`, color: '#fff' } : undefined}>
+                                        {isPrev
+                                          ? <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1" /><rect x="14" y="5" width="4" height="14" rx="1" /></svg>
+                                          : <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>}
+                                      </button>
+                                    ) : null}
+                                    {inLib ? (
+                                      <span className="xp-dl" aria-label="In library" title="Already in your library" style={{ color: '#8ae08a', cursor: 'default' }}>
+                                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+                                      </span>
+                                    ) : unavailable ? (
+                                      <button type="button" className="xp-dl" disabled aria-label="Not yet available" title="Not yet available"
+                                        style={{ cursor: 'default', opacity: 0.5 }}>
+                                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></svg>
+                                      </button>
+                                    ) : (
+                                      <button type="button" className={`xp-dl${st ? ` ${st}` : ''}`} aria-label="Download" title={st || 'Download'}
+                                        onClick={(e) => { e.stopPropagation(); if (!st || st === 'failed') downloadAlbumTrack(a, tk); }}>{dlIcon(st)}</button>
+                                    )}
                                   </div>
                                 );
                               }) : <div className="xp-msg">No track information.</div>}
@@ -865,6 +993,14 @@ function WelcomeScreen({
               })}
             </div>
           )}
+          {followedNewReleases.length > 6 ? (
+            <button type="button" className="xp-viewmore" style={{ '--acc': accent }}
+              onClick={() => setReleasesExpanded((v) => !v)}>
+              {releasesExpanded ? 'Show fewer' : `Show all ${followedNewReleases.length}`}
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+                style={{ transform: releasesExpanded ? 'rotate(180deg)' : 'none', transition: 'transform .25s' }}><path d="M6 9l6 6 6-6" /></svg>
+            </button>
+          ) : null}
         </section>
 
         {/* 2 — Top Songs (Apple charts) — 2-column grid, 2×5 default, expand to 50 */}
@@ -882,6 +1018,7 @@ function WelcomeScreen({
                 {charts.songs.slice(0, songsExpanded ? 50 : 10).map((s, i) => {
                   const key = `song:${s.id}`;
                   const st = dlState[key];
+                  const inLib = trackInLibrary(s.name, s.artistName);
                   return (
                     <div key={s.id} className="xp-song" style={{ '--acc': accent, animationDelay: `${(i % 10) * 40}ms` }}>
                       <span className="xp-rank">{i + 1}</span>
@@ -890,10 +1027,16 @@ function WelcomeScreen({
                         <span className="xp-song-t">{s.name}</span>
                         <span className="xp-song-a">{s.artistName}{s.genre ? ` · ${s.genre}` : ''}</span>
                       </span>
-                      <button type="button" className={`xp-dl${st ? ` ${st}` : ''}`} aria-label="Download"
-                        title={st || 'Download'} onClick={() => { if (!st || st === 'failed') downloadChartSong(s); }}>
-                        {dlIcon(st)}
-                      </button>
+                      {inLib ? (
+                        <span className="xp-dl" aria-label="In library" title="Already in your library" style={{ color: '#8ae08a', cursor: 'default' }}>
+                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+                        </span>
+                      ) : (
+                        <button type="button" className={`xp-dl${st ? ` ${st}` : ''}`} aria-label="Download"
+                          title={st || 'Download'} onClick={() => { if (!st || st === 'failed') downloadChartSong(s); }}>
+                          {dlIcon(st)}
+                        </button>
+                      )}
                     </div>
                   );
                 })}

@@ -538,6 +538,31 @@ export default function App() {
     } catch { /* ignore */ }
   }, [coverFullscreenEnabled]);
 
+  const [previewVolumePosition, setPreviewVolumePosition] = useState(() => {
+    try {
+      return typeof window !== 'undefined'
+        ? window.localStorage.getItem('immerse:previewVolumePosition') || 'bottomRight'
+        : 'bottomRight';
+    } catch { return 'bottomRight'; }
+  });
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('immerse:previewVolumePosition', previewVolumePosition);
+    } catch { /* ignore */ }
+  }, [previewVolumePosition]);
+
+  const [nowPlayingSliderStyle, setNowPlayingSliderStyle] = useState(() => {
+    try {
+      const value = typeof window !== 'undefined' ? window.localStorage.getItem('immerse:nowPlayingSliderStyle') : null;
+      return value === 'heart' ? 'heart' : 'circle';
+    } catch { return 'circle'; }
+  });
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('immerse:nowPlayingSliderStyle', nowPlayingSliderStyle);
+    } catch { /* ignore */ }
+  }, [nowPlayingSliderStyle]);
+
   /* ---------- Experimental (Dev) toggles ----------------------------------
    *
    * Each of these gates a feature that's still being shaped. They live behind
@@ -1996,12 +2021,40 @@ export default function App() {
     setImporting(false);
   };
 
-  const playTrack = (track, sortedList) => {
-    const source = sortedList && sortedList.length > 0 ? sortedList : sortByTitle(library);
-    const q = shuffleOn ? shuffleArray([...source]) : [...source];
-    const idx = q.findIndex((t) => t.id === track.id);
-    setQueue(q);
-    setCurrentIndex(idx >= 0 ? idx : 0);
+  /**
+   * Build the play queue for a clicked track.
+   *
+   *   context 'single'  — the track was a one-off (e.g. a free-text song search
+   *                       that didn't resolve to a coherent artist/album). Play
+   *                       it, then continue with a random shuffle of the rest of
+   *                       the library.
+   *   context 'list'    — the track belongs to a group the user is looking at
+   *                       (an artist, an album, a coherent search, or the whole
+   *                       library). Queue that whole list.
+   *
+   * Either way, when shuffle is ON the clicked track goes FIRST and the rest is
+   * shuffled after it (matching the shuffle-toggle behavior) — so playing a new
+   * track always starts a fresh queue from that track instead of dropping you
+   * into the middle of the old shuffled order.
+   */
+  const playTrack = (track, sortedList, context = 'list') => {
+    if (context === 'single') {
+      const rest = shuffleArray(library.filter((t) => t.id !== track.id));
+      setQueue([track, ...rest]);
+      setCurrentIndex(0);
+    } else {
+      const source = sortedList && sortedList.length > 0 ? sortedList : sortByTitle(library);
+      if (shuffleOn) {
+        const rest = shuffleArray(source.filter((t) => t.id !== track.id));
+        setQueue([track, ...rest]);
+        setCurrentIndex(0);
+      } else {
+        const q = [...source];
+        const idx = q.findIndex((t) => t.id === track.id);
+        setQueue(q);
+        setCurrentIndex(idx >= 0 ? idx : 0);
+      }
+    }
     if (!hasEverPlayed) setHasEverPlayed(true);
   };
 
@@ -2118,7 +2171,7 @@ export default function App() {
     if (!hasEverPlayed) setHasEverPlayed(true);
   }, [queue.length, hasEverPlayed]);
 
-  const playPauseLibraryRow = (track, sortedList) => {
+  const playPauseLibraryRow = (track, sortedList, context = 'list') => {
     if (currentTrack?.id === track.id && isPlaying) {
       audioRef.current?.pause();
       return;
@@ -2127,7 +2180,7 @@ export default function App() {
       audioRef.current?.play()?.catch(() => {});
       return;
     }
-    playTrack(track, sortedList);
+    playTrack(track, sortedList, context);
   };
 
   const handleSpotifyImportDone = async (track) => {
@@ -2743,13 +2796,37 @@ export default function App() {
     // Emit as array of { displayName, key, source }
     return [...auto].map((key) => {
       const override = followOverrides.find((o) => o.artistName.toLowerCase() === key && o.action === 'add');
+      const resolved = followOverrides.find((o) => o.artistName.toLowerCase() === key && o.itunesArtistId);
       return {
         key,
         displayName: displayByLower.get(key) || key,
+        itunesArtistId: resolved?.itunesArtistId ?? null,
         source: override ? 'manual' : 'auto',
       };
     }).sort((a, b) => a.displayName.localeCompare(b.displayName));
   }, [library, followOverrides]);
+
+  /**
+   * Releases actually shown anywhere (New Releases tab + welcome screen).
+   * The cache in the DB keeps records for artists you've since un-followed (and
+   * can hold albums from a different artist that shares a name), so we filter to
+   * the current followed set here. When a followed artist is pinned to a
+   * specific iTunes artist ID, only that artist's releases pass — so following a
+   * particular "Moors" doesn't surface every other "Moors".
+   */
+  const visibleReleases = useMemo(() => {
+    const primaryArtist = (str) => (str ? str.split(/,|feat\.|ft\.|&|\bx\b/i)[0].trim().toLowerCase() : '');
+    const byKey = new Map();
+    for (const a of followedArtists) byKey.set(a.key, a);
+    return (releases || []).filter((r) => {
+      const entry = byKey.get(primaryArtist(r.artistName));
+      if (!entry) return false; // artist no longer followed
+      if (entry.itunesArtistId && r.itunesArtistId) {
+        return Number(entry.itunesArtistId) === Number(r.itunesArtistId);
+      }
+      return true; // followed by name with no pinned ID yet
+    });
+  }, [releases, followedArtists]);
 
   /**
    * Auto-refresh releases once per app session, a few seconds after bootstrap,
@@ -2818,10 +2895,10 @@ export default function App() {
     } catch (e) { console.error('refreshOverrides', e); }
   };
 
-  const addFollowedArtist = async (artistName) => {
+  const addFollowedArtist = async (artistName, itunesArtistId = null) => {
     const api = window.electronAPI;
     if (!api?.addFollowedArtist) return { ok: false };
-    const r = await api.addFollowedArtist(artistName);
+    const r = await api.addFollowedArtist(artistName, itunesArtistId);
     if (r?.ok) await refreshOverrides();
     return r;
   };
@@ -2973,6 +3050,7 @@ export default function App() {
         onImportFiles={importFiles}
         onImportFolder={importFolder}
         onSpotifyImportDone={handleSpotifyImportDone}
+        onPreviewPlay={() => { try { audioRef.current?.pause(); } catch { /* */ } setIsPlaying(false); }}
         onRemoveFromLibrary={removeTracksFromLibrary}
         onUpdateTrackMetadata={updateTrackMetadata}
         onUpdateAlbumMetadata={updateAlbumMetadata}
@@ -3058,6 +3136,10 @@ export default function App() {
         onSetPanelWidth={setPanelWidth}
         dockPosition={dockPosition}
         onSetDockPosition={setDockPosition}
+        previewVolumePosition={previewVolumePosition}
+        onSetPreviewVolumePosition={setPreviewVolumePosition}
+        nowPlayingSliderStyle={nowPlayingSliderStyle}
+        onSetNowPlayingSliderStyle={setNowPlayingSliderStyle}
         playEvents={playEvents}
         onResetStats={resetAllStats}
         statsRangeTabsEnabled={statsRangeTabsEnabled}
@@ -3073,7 +3155,7 @@ export default function App() {
         onReorderQueue={reorderQueue}
         onClearUpNext={clearUpNext}
         onJumpToQueueIndex={jumpToQueueIndex}
-        releases={releases}
+        releases={visibleReleases}
         followedArtists={followedArtists}
         followOverrides={followOverrides}
         releasesRefreshing={releasesRefreshing}

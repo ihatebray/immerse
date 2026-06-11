@@ -550,6 +550,10 @@ function searchYoutubeCandidates(query, count, ytDlp) {
       '--skip-download',
       '--flat-playlist',
       '-J',
+      '--extractor-args', 'youtube:player_client=android,ios,tv,web',
+      '--retries', '4',
+      '--extractor-retries', '2',
+      '--retry-sleep', 'exp=1:20',
       '--default-search', 'ytsearch',
       `ytsearch${count}:${query}`,
     ];
@@ -605,8 +609,13 @@ function pickBestCandidate(candidates, params) {
 
 /**
  * Download a specific YouTube video by ID, extract audio, save to disk.
+ *
+ * `cookiesFromBrowser` (optional): a browser name ('chrome'|'edge'|'firefox'|
+ * 'brave') to pull YouTube cookies from automatically — used as a fallback when
+ * a video is age-gated or YouTube demands sign-in, so the user never has to
+ * export cookies by hand.
  */
-function downloadById(videoId, { ytDlp, ffmpeg, outDir, stamp, onLog }) {
+function downloadById(videoId, { ytDlp, ffmpeg, outDir, stamp, onLog, cookiesFromBrowser } = {}) {
   return new Promise((resolve, reject) => {
     const outTemplate = path.join(outDir, `yt-import-${stamp}.%(ext)s`);
     const args = [
@@ -616,8 +625,22 @@ function downloadById(videoId, { ytDlp, ffmpeg, outDir, stamp, onLog }) {
       '--audio-quality', '0',
       '--embed-metadata',
       '--embed-thumbnail',
+      // Use the android/ios/tv players first: they don't require a JS runtime
+      // (the web client now needs Deno) and dodge most "confirm you're not a
+      // bot" / age-gate interstitials without any cookies.
+      '--extractor-args', 'youtube:player_client=android,ios,tv,web',
+      // Survive YouTube's rate limiting (HTTP 429) with retries + backoff
+      // instead of failing outright.
+      '--retries', '5',
+      '--extractor-retries', '3',
+      '--retry-sleep', 'exp=1:30',
+      '--sleep-requests', '1',
+      '--geo-bypass',
       '-o', outTemplate,
     ];
+    if (cookiesFromBrowser) {
+      args.push('--cookies-from-browser', cookiesFromBrowser);
+    }
     if (fs.existsSync(ffmpeg)) {
       args.push('--ffmpeg-location', path.dirname(ffmpeg));
     }
@@ -630,7 +653,9 @@ function downloadById(videoId, { ytDlp, ffmpeg, outDir, stamp, onLog }) {
     proc.on('error', reject);
     proc.on('close', (code) => {
       if (code !== 0) {
-        reject(new Error(`yt-dlp exited with ${code}\n${stderr.slice(-2000)}`));
+        const err = new Error(`yt-dlp exited with ${code}\n${stderr.slice(-2000)}`);
+        err.stderr = stderr;
+        reject(err);
         return;
       }
       const expected = path.join(outDir, `yt-import-${stamp}.mp3`);
@@ -646,6 +671,42 @@ function downloadById(videoId, { ytDlp, ffmpeg, outDir, stamp, onLog }) {
       resolve(candidates[0]);
     });
   });
+}
+
+/**
+ * Errors that mean "this specific video is blocked for us" (age-gate, bot
+ * check, rate-limit, private/members-only) — worth retrying with cookies and,
+ * failing that, moving on to a different candidate.
+ */
+function isBlockedError(msg) {
+  return /sign in to confirm|not a bot|confirm your age|age-restricted|age restricted|inappropriate|consent|HTTP Error 429|Too Many Requests|private video|members-only|join this channel|login required|requires? (a )?(login|sign)/i
+    .test(String(msg || ''));
+}
+
+/**
+ * Download a video id, automatically retrying with browser cookies if YouTube
+ * blocks it (age-gate / bot check / rate-limit). Tries common browsers in turn
+ * so the user never has to export cookies manually. Throws if every attempt
+ * fails.
+ */
+async function downloadByIdResilient(videoId, opts) {
+  try {
+    return await downloadById(videoId, opts);
+  } catch (e) {
+    const msg = e?.stderr || e?.message || '';
+    if (!isBlockedError(msg)) throw e;
+    opts.onLog?.(`[ytdlp] ${videoId} blocked (age/bot/rate-limit) — retrying with browser cookies…\n`);
+    let lastErr = e;
+    for (const browser of ['chrome', 'edge', 'firefox', 'brave']) {
+      try {
+        return await downloadById(videoId, { ...opts, stamp: Date.now(), cookiesFromBrowser: browser });
+      } catch (e2) {
+        lastErr = e2;
+        // Browser not installed / cookies locked → just try the next one.
+      }
+    }
+    throw lastErr;
+  }
 }
 
 /**
@@ -732,8 +793,30 @@ export async function downloadYoutubeAudioForQuery({ artists, title, targetDurat
     `(${Math.round(c.duration || 0)}s, target ${Math.round(targetDurationSec)}s)\n`
   );
 
-  const stamp = Date.now();
-  return downloadById(c.id, { ytDlp, ffmpeg, outDir, stamp, onLog });
+  // Attempt order: the winner first, then other candidates whose duration is
+  // close to the target (so we still get the right song), so an age-gated or
+  // otherwise-blocked top pick falls through to a downloadable alternative
+  // instead of failing the whole import.
+  const attempts = [c];
+  const fallbacks = allCandidates
+    .filter((x) => x.id && x.id !== c.id && (x.duration || 0) > 0)
+    .filter((x) => !targetDurationSec || Math.abs((x.duration || 0) - targetDurationSec) <= 12)
+    .sort((a, b) => Math.abs((a.duration || 0) - targetDurationSec) - Math.abs((b.duration || 0) - targetDurationSec));
+  attempts.push(...fallbacks);
+
+  const tried = new Set();
+  let lastErr = null;
+  for (const cand of attempts.slice(0, 4)) {
+    if (!cand?.id || tried.has(cand.id)) continue;
+    tried.add(cand.id);
+    try {
+      return await downloadByIdResilient(cand.id, { ytDlp, ffmpeg, outDir, stamp: Date.now(), onLog });
+    } catch (e) {
+      lastErr = e;
+      onLog?.(`[ytdlp] candidate ${cand.id} failed (${String(e?.message || e).split('\n')[0]}); trying next…\n`);
+    }
+  }
+  throw lastErr || new Error('Every candidate failed to download.');
 }
 
 /**
@@ -748,7 +831,7 @@ export async function downloadYoutubeAudioById(videoId, { onLog } = {}) {
   const outDir = path.join(app.getPath('userData'), 'streaming-imports');
   fs.mkdirSync(outDir, { recursive: true });
   const stamp = Date.now();
-  return downloadById(videoId, { ytDlp, ffmpeg, outDir, stamp, onLog });
+  return downloadByIdResilient(videoId, { ytDlp, ffmpeg, outDir, stamp, onLog });
 }
 
 /**

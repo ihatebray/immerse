@@ -1,5 +1,16 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { createPortal } from 'react-dom';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+
+// Normalize a track title/artist for "do I already own this song" matching,
+// since iTunes and yt-dlp/Spotify metadata rarely share IDs. Strips featured-
+// artist decoration so "Song (feat. X)" matches "Song".
+const normTrackTitle = (s) => (s || '').toLowerCase().trim()
+  .replace(/\s*\((?:feat|ft|with)\.?[^)]*\)/gi, '')
+  .replace(/\s*-\s*(?:feat|ft)\.?.*$/i, '')
+  .trim();
+const primaryArtistOf = (s) => (s || '').toLowerCase()
+  .split(/,|&|\bfeat\.?|\bft\.?/i)[0].trim();
+const libTrackKey = (title, artist) => `${normTrackTitle(title)}|${primaryArtistOf(artist)}`;
+const normAlbum = (s) => (s || '').toLowerCase().trim().replace(/\s*-\s*(?:single|ep)$/i, '').trim();
 
 function NewReleasesTab({
   releases,
@@ -15,6 +26,8 @@ function NewReleasesTab({
   accent,
   onShowCandidatePicker,
   onSpotifyImportDone,
+  onPreviewPlay,
+  previewVolumePosition = 'bottomRight',
 }) {
   const [manageOpen, setManageOpen] = useState(false);
   /** Map<collectionId, { status: 'fetching'|'downloading'|'done'|'error', current, total, error? }> */
@@ -28,6 +41,48 @@ function NewReleasesTab({
   const [trackLoading, setTrackLoading] = useState({});
   const [trackError, setTrackError] = useState({});
   const [trackDl, setTrackDl] = useState({});          // {`${cid}:${trackId}`: 'queued'|'done'|'failed'}
+
+  // 30-second iTunes preview playback. Only one preview plays at a time.
+  const [previewKey, setPreviewKey] = useState(null);  // `${cid}:${trackId}` currently previewing
+  const [previewIsSingle, setPreviewIsSingle] = useState(false);
+  const [previewVolume, setPreviewVolume] = useState(() => {
+    try { const v = parseFloat(localStorage.getItem('immerse:previewVolume')); return Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0.45; } catch { return 0.45; }
+  });
+  const previewAudioRef = useRef(null);
+  const prevVolRef = useRef(0.45); // remembers volume across mute toggles
+  const volTrackRef = useRef(null);
+  const volDragRef = useRef(false);
+  // Keep the live audio in sync with the slider, and remember the choice.
+  useEffect(() => {
+    if (previewAudioRef.current) previewAudioRef.current.volume = previewVolume;
+    try { localStorage.setItem('immerse:previewVolume', String(previewVolume)); } catch { /* */ }
+  }, [previewVolume]);
+
+  const togglePreview = useCallback((release, tk, isSingle = false) => {
+    const url = tk?.previewUrl;
+    if (!url) return;
+    const audio = previewAudioRef.current;
+    if (!audio) return;
+    const key = `${release.collectionId}:${tk.trackId}`;
+    if (previewKey === key) { try { audio.pause(); } catch { /* */ } setPreviewKey(null); return; }
+    onPreviewPlay?.();            // ask the parent to pause the main player first
+    try {
+      audio.src = url;
+      audio.currentTime = 0;
+      audio.volume = previewVolume;
+      audio.play().then(() => { setPreviewKey(key); setPreviewIsSingle(isSingle); }).catch(() => setPreviewKey(null));
+    } catch { setPreviewKey(null); }
+  }, [previewKey, onPreviewPlay, previewVolume]);
+
+  // Stop the preview if its album is collapsed (albums only — singles aren't
+  // expanded, so they'd be killed instantly), and on unmount.
+  useEffect(() => {
+    if (previewKey && !previewIsSingle && !String(previewKey).startsWith(`${expandedId}:`)) {
+      try { previewAudioRef.current?.pause(); } catch { /* */ }
+      setPreviewKey(null);
+    }
+  }, [expandedId, previewKey, previewIsSingle]);
+  useEffect(() => () => { try { previewAudioRef.current?.pause(); } catch { /* */ } }, []);
 
   const toggleExpand = useCallback((release) => {
     const id = Number(release?.collectionId);
@@ -81,6 +136,15 @@ function NewReleasesTab({
     } catch { setTrackDl((m) => ({ ...m, [key]: 'failed' })); }
   }, [trackDl, onShowCandidatePicker, onSpotifyImportDone]);
 
+  // Download every track from a release that isn't already in the library,
+  // one at a time (so we don't fire a dozen YouTube searches at once).
+  const downloadMissing = useCallback(async (release, list) => {
+    for (const tk of list) {
+      // eslint-disable-next-line no-await-in-loop
+      await downloadOneTrack(release, tk);
+    }
+  }, [downloadOneTrack]);
+
   const fmtDur = (ms) => { if (!ms) return ''; const s = Math.round(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
 
   const setDownloadState = (collectionId, patch) => {
@@ -92,23 +156,50 @@ function NewReleasesTab({
     });
   };
 
-  /**
-   * Check whether a release is already in the library. We match on album name
-   * + primary artist (case-insensitive) since iTunes and yt-dlp metadata may
-   * not share IDs.
-   */
-  const isInLibrary = useCallback((release) => {
-    if (!release?.collectionName || !release?.artistName) return false;
-    const targetAlbum = release.collectionName.toLowerCase().trim();
-    const targetArtist = release.artistName.toLowerCase().trim();
-    return library.some((t) => {
-      const tAlbum = (t.album || '').toLowerCase().trim();
-      if (tAlbum !== targetAlbum) return false;
-      const tArtist = (t.artist || '').toLowerCase().trim();
-      // Artist just needs to START with the target (to handle "Artist, feat. X")
-      return tArtist === targetArtist || tArtist.startsWith(`${targetArtist},`) || tArtist.startsWith(`${targetArtist} `);
-    });
+  // Fast lookup of which tracks are already in the library (title + primary artist).
+  const libraryTrackKeys = useMemo(() => {
+    const set = new Set();
+    for (const t of library) { if (t?.title) set.add(libTrackKey(t.title, t.artist)); }
+    return set;
   }, [library]);
+  const trackInLibrary = useCallback((title, artist) => libraryTrackKeys.has(libTrackKey(title, artist)), [libraryTrackKeys]);
+
+  // How many tracks of each album+artist we already own (for "do I have the
+  // whole album" without fetching its tracklist).
+  const albumOwnedCounts = useMemo(() => {
+    const m = new Map();
+    for (const t of library) {
+      if (!t?.album) continue;
+      const k = `${normAlbum(t.album)}|${primaryArtistOf(t.artist)}`;
+      m.set(k, (m.get(k) || 0) + 1);
+    }
+    return m;
+  }, [library]);
+  // "Fully owned" pre-expansion: a single counts as owned if we have that song;
+  // an album if we own at least as many tracks as iTunes lists.
+  const albumFullyOwned = useCallback((r) => {
+    const tc = Number(r?.trackCount) || 0;
+    if (tc <= 1) return trackInLibrary((r?.collectionName || '').replace(/\s*-\s*single$/i, ''), r?.artistName);
+    const k = `${normAlbum(r?.collectionName)}|${primaryArtistOf(r?.artistName)}`;
+    return (albumOwnedCounts.get(k) || 0) >= tc;
+  }, [albumOwnedCounts, trackInLibrary]);
+
+  // Single / one-song release preview: fetch its single track (once) to get the
+  // 30s previewUrl, then play it.
+  const toggleSinglePreview = useCallback(async (release) => {
+    const id = Number(release?.collectionId);
+    let tks = trackCache[id];
+    if (!Array.isArray(tks)) {
+      const api = typeof window !== 'undefined' ? window.electronAPI : null;
+      if (!api?.lookupReleaseAlbumTracks) return;
+      try {
+        const res = await api.lookupReleaseAlbumTracks(id);
+        if (res?.ok && Array.isArray(res.tracks)) { tks = res.tracks; setTrackCache((m) => ({ ...m, [id]: res.tracks })); }
+      } catch { return; }
+    }
+    const tk = Array.isArray(tks) ? tks[0] : null;
+    if (tk?.previewUrl) togglePreview(release, tk, true);
+  }, [trackCache, togglePreview]);
 
   const handleImport = async (release) => {
     if (!onImportRelease) return;
@@ -171,8 +262,30 @@ function NewReleasesTab({
     await onRefresh();
   };
 
+  // Minimal volume bar shown directly under the preview/download buttons of
+  // whichever row is currently previewing. Only one row previews at a time, so
+  // the shared track ref is fine.
+  const setVolFromEvent = (e) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    setPreviewVolume(Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)));
+  };
+  const renderVolBar = (width = 62) => (
+    <div ref={volTrackRef}
+      aria-label="Preview volume"
+      onClick={(e) => e.stopPropagation()}
+      onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* */ } volDragRef.current = true; setVolFromEvent(e); }}
+      onPointerMove={(e) => { if (volDragRef.current) setVolFromEvent(e); }}
+      onPointerUp={(e) => { volDragRef.current = false; try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* */ } }}
+      style={{ position: 'relative', width, height: 12, display: 'flex', alignItems: 'center', cursor: 'pointer', flexShrink: 0 }}>
+      <div style={{ width: '100%', height: 3, borderRadius: 2, background: 'rgba(255,255,255,0.18)' }}>
+        <div style={{ width: `${previewVolume * 100}%`, height: '100%', borderRadius: 2, background: `rgba(${accent},0.9)` }} />
+      </div>
+      <div style={{ position: 'absolute', left: `${previewVolume * 100}%`, top: '50%', transform: 'translate(-50%,-50%)', width: 8, height: 8, borderRadius: '50%', background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,0.4)' }} />
+    </div>
+  );
+
   return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }}>
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden', position: 'relative' }}>
       {/* Inline keyframes (spin) */}
       <style>{`
         @keyframes immerseSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
@@ -180,6 +293,14 @@ function NewReleasesTab({
         .xpl-icbtn { transition: color .15s, background .15s, border-color .15s; }
       `}</style>
 
+      {/* Hidden element that plays the 30s iTunes preview clips */}
+      <audio ref={previewAudioRef} preload="none" onEnded={() => setPreviewKey(null)} />
+
+      {/* The body is hidden while the manager is open so the frosted card sits
+          over the dock's blurred ambient (a cover image, no text) — matching how
+          the Edit-metadata modal opens over the cover. */}
+      {!manageOpen ? (
+       <>
       {/* ===== Explore actions — refresh + find-follow (identity header is
            now the shared panel header above) ===== */}
       <div style={{ padding: '12px 14px 12px' }}>
@@ -255,7 +376,6 @@ function NewReleasesTab({
         ) : (
           releases.map((r) => {
             const dl = downloads.get(r.collectionId);
-            const inLibrary = isInLibrary(r);
             const isBusy = dl && (dl.status === 'fetching' || dl.status === 'downloading');
             const isDone = dl && dl.status === 'done';
             const isError = dl && dl.status === 'error';
@@ -264,18 +384,32 @@ function NewReleasesTab({
             const tks = trackCache[Number(r.collectionId)];
             const tkLoading = trackLoading[Number(r.collectionId)];
             const tkErr = trackError[Number(r.collectionId)];
+            // Album ownership is computed from the actual tracklist (once loaded),
+            // NOT "any one track matches" — otherwise owning a single song marked
+            // the whole album as in-library and hid the download. "Fully owned"
+            // means every *available* track is already in the library.
+            const availTks = Array.isArray(tks) ? tks.filter((tk) => tk.isStreamable !== false) : [];
+            const missingTks = availTks.filter((tk) => !trackInLibrary(tk.trackName, tk.artistName || r.artistName));
+            const allOwned = availTks.length > 0 && missingTks.length === 0;
+            // Row mode: singles/one-song releases get no dropdown (just preview +
+            // download); fully-owned releases collapse to an "in library" marker
+            // and can't be expanded; everything else is an expandable album.
+            const isSingle = (Number(r.trackCount) || 0) <= 1;
+            const fullyOwned = albumFullyOwned(r);
+            const expandable = !isSingle && !fullyOwned;
+            const singlePrev = !!previewKey && String(previewKey).startsWith(`${r.collectionId}:`);
             return (
               <div key={`${r.itunesArtistId}:${r.collectionId}`} style={{ marginBottom: 3 }}>
               <div
                 className="xpl-row"
                 style={{
                   width: '100%', display: 'flex', alignItems: 'center', gap: 12,
-                  padding: '8px 10px', borderRadius: 12, cursor: 'pointer',
+                  padding: '8px 10px', borderRadius: 12, cursor: expandable ? 'pointer' : 'default',
                   background: open ? `rgba(${accent},0.1)` : 'transparent',
                   border: open ? `1px solid rgba(${accent},0.25)` : '1px solid transparent',
                 }}
-                onClick={() => toggleExpand(r)}
-                onMouseEnter={(e) => { if (!open) e.currentTarget.style.background = 'rgba(255,255,255,0.04)'; }}
+                onClick={() => { if (expandable) toggleExpand(r); }}
+                onMouseEnter={(e) => { if (expandable && !open) e.currentTarget.style.background = 'rgba(255,255,255,0.04)'; }}
                 onMouseLeave={(e) => { if (!open) e.currentTarget.style.background = 'transparent'; }}>
                 <div style={{
                   width: 52, height: 52, borderRadius: 9, overflow: 'hidden', flexShrink: 0,
@@ -323,77 +457,105 @@ function NewReleasesTab({
                     ) : null}
                   </div>
                 </div>
-                {/* Download button — shows library-checkmark if already in library */}
-                {inLibrary && !isBusy && !isDone ? (
-                  <div title="Already in your library"
-                    aria-label="In library"
-                    style={{
-                      width: 30, height: 30, borderRadius: 8, flexShrink: 0,
-                      display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      color: 'rgba(255,255,255,0.35)',
-                    }}>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                      <polyline points="20 6 9 17 4 12" />
-                    </svg>
+                {/* Right side: fully-owned → marker; single → preview+download;
+                    album → status + expand chevron. */}
+                {fullyOwned ? (
+                  <div title="Already in your library" aria-label="In library"
+                    style={{ width: 28, height: 28, borderRadius: '50%', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(138,224,138,0.14)', color: '#8ae08a' }}>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+                  </div>
+                ) : isSingle ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6, flexShrink: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <button type="button" onClick={(e) => { e.stopPropagation(); toggleSinglePreview(r); }}
+                      title={singlePrev ? 'Stop preview' : 'Preview (30s)'} aria-label="Preview"
+                      style={{
+                        width: 28, height: 28, borderRadius: '50%', border: 'none', cursor: 'pointer',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        background: singlePrev ? `rgba(${accent},0.85)` : 'rgba(255,255,255,0.08)', color: '#fff', transition: 'background 0.15s',
+                      }}>
+                      {singlePrev
+                        ? <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1" /><rect x="14" y="5" width="4" height="14" rx="1" /></svg>
+                        : <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>}
+                    </button>
+                    <button type="button"
+                      onClick={(e) => { e.stopPropagation(); if (!isBusy && !isDone) handleImport(r); }}
+                      disabled={isBusy || isDone}
+                      title={isBusy ? 'Downloading…' : isDone ? 'Added' : isError ? 'Failed — retry' : 'Download'}
+                      aria-label="Download single"
+                      style={{
+                        width: 28, height: 28, borderRadius: '50%', border: 'none', cursor: isBusy || isDone ? 'default' : 'pointer',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        background: isDone ? 'rgba(138,224,138,0.85)' : isBusy ? `rgba(${accent},0.5)` : isError ? 'rgba(243,114,114,0.7)' : 'rgba(255,255,255,0.08)',
+                        color: '#fff', transition: 'background 0.15s',
+                      }}>
+                      {isBusy ? (
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" style={{ animation: 'immerseSpin 0.9s linear infinite' }}><path d="M21 12a9 9 0 1 1-6.2-8.55" /></svg>
+                      ) : isDone ? (
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+                      ) : isError ? (
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+                      ) : (
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 21h14" /></svg>
+                      )}
+                    </button>
+                    </div>
+                    {singlePrev && previewVolumePosition === 'underButtons' ? renderVolBar(62) : null}
                   </div>
                 ) : (
-                  <button type="button"
-                    onClick={(e) => { e.stopPropagation(); handleImport(r); }}
-                    disabled={isBusy || isDone}
-                    title={isBusy ? 'Downloading…' : isDone ? 'Imported' : 'Import this album'}
-                    aria-label={isBusy ? 'Downloading album' : 'Import album'}
-                    style={{
-                      width: 30, height: 30, borderRadius: 8, flexShrink: 0,
-                      border: '1px solid rgba(255,255,255,0.12)',
-                      background: isDone ? 'rgba(138,224,138,0.15)'
-                        : isError ? 'rgba(243,114,114,0.1)'
-                        : isBusy ? `rgba(${accent},0.18)`
-                        : 'rgba(0,0,0,0.25)',
-                      color: isDone ? '#8ae08a'
-                        : isError ? '#f37272'
-                        : isBusy ? `rgba(${accent},1)`
-                        : 'rgba(255,255,255,0.75)',
-                      cursor: isBusy || isDone ? 'default' : 'pointer',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0,
-                      transition: 'color 0.15s, background 0.15s',
-                    }}
-                    onMouseEnter={(e) => { if (!isBusy && !isDone) { e.currentTarget.style.color = '#fff'; e.currentTarget.style.background = `rgba(${accent},0.25)`; } }}
-                    onMouseLeave={(e) => { if (!isBusy && !isDone) { e.currentTarget.style.color = 'rgba(255,255,255,0.75)'; e.currentTarget.style.background = 'rgba(0,0,0,0.25)'; } }}>
+                  <>
                     {isBusy ? (
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"
-                        style={{ animation: 'immerseSpin 0.9s linear infinite' }}>
-                        <path d="M21 12a9 9 0 1 1-6.2-8.55" />
-                      </svg>
+                      <div aria-label="Downloading" style={{ width: 24, height: 24, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: `rgba(${accent},1)` }}>
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" style={{ animation: 'immerseSpin 0.9s linear infinite' }}><path d="M21 12a9 9 0 1 1-6.2-8.55" /></svg>
+                      </div>
                     ) : isDone ? (
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
-                        <polyline points="20 6 9 17 4 12" />
-                      </svg>
-                    ) : isError ? (
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                        <line x1="18" y1="6" x2="6" y2="18" />
-                        <line x1="6" y1="6" x2="18" y2="18" />
-                      </svg>
-                    ) : (
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                        <polyline points="7 10 12 15 17 10" />
-                        <line x1="12" y1="15" x2="12" y2="3" />
-                      </svg>
-                    )}
-                  </button>
+                      <div aria-label="Added" style={{ width: 24, height: 24, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#8ae08a' }}>
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+                      </div>
+                    ) : null}
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.4)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+                      style={{ flexShrink: 0, transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }}>
+                      <polyline points="6 9 12 15 18 9" />
+                    </svg>
+                  </>
                 )}
-                {/* expand chevron */}
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.4)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
-                  style={{ flexShrink: 0, transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }}>
-                  <polyline points="6 9 12 15 18 9" />
-                </svg>
               </div>
 
-              {open ? (
+              {open && expandable ? (
                 <div style={{
                   margin: '2px 4px 8px', borderRadius: 9, overflow: 'hidden',
                   background: 'rgba(0,0,0,0.22)', border: '1px solid rgba(255,255,255,0.06)',
                 }}>
+                  {/* Download-all — the album download lives here now, not on the row */}
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '8px 9px', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+                    <button type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (isBusy || isDone || allOwned) return;
+                        if (availTks.length) downloadMissing(r, missingTks);
+                        else handleImport(r); // tracks not loaded yet — fall back to whole-album import
+                      }}
+                      disabled={isBusy || isDone || allOwned}
+                      title={allOwned ? 'Every track is already in your library' : isBusy ? 'Downloading…' : isDone ? 'Added' : 'Download the tracks you don’t have yet'}
+                      style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 7, padding: '6px 12px', borderRadius: 8,
+                        border: '1px solid rgba(255,255,255,0.12)', background: isBusy ? `rgba(${accent},0.18)` : 'rgba(0,0,0,0.25)',
+                        color: allOwned || isDone ? 'rgba(255,255,255,0.45)' : isBusy ? `rgba(${accent},1)` : 'rgba(255,255,255,0.85)',
+                        fontSize: 11, fontWeight: 600, cursor: isBusy || isDone || allOwned ? 'default' : 'pointer', transition: 'color 0.15s, background 0.15s',
+                      }}>
+                      {isBusy ? (
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" style={{ animation: 'immerseSpin 0.9s linear infinite' }}><path d="M21 12a9 9 0 1 1-6.2-8.55" /></svg>
+                      ) : (
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
+                      )}
+                      {allOwned ? 'All in your library'
+                        : isBusy ? `Downloading${dl.total ? ` ${dl.current}/${dl.total}` : '…'}`
+                        : isDone ? `Added${dl.failed ? ` · ${dl.failed} failed` : ''}`
+                        : (availTks.length && missingTks.length < availTks.length) ? `Download ${missingTks.length} missing`
+                        : 'Download all'}
+                    </button>
+                    {isError ? <span style={{ fontSize: 10, color: '#f37272' }} title={dl.error}>Failed — try again</span> : null}
+                  </div>
                   {tkLoading ? (
                     <div style={{ padding: '14px', textAlign: 'center', fontSize: 10.5, color: 'rgba(255,255,255,0.5)' }}>Loading tracks…</div>
                   ) : tkErr ? (
@@ -402,15 +564,57 @@ function NewReleasesTab({
                     tks.map((tk, ti) => {
                       const key = `${r.collectionId}:${tk.trackId}`;
                       const st = trackDl[key];
+                      const isPrev = previewKey === key;
+                      const unavailable = tk.isStreamable === false;
+                      const inLib = trackInLibrary(tk.trackName, tk.artistName || r.artistName);
                       return (
                         <div key={tk.trackId || ti} style={{
                           display: 'flex', alignItems: 'center', gap: 9, padding: '6px 9px',
                           borderTop: ti === 0 ? 'none' : '1px solid rgba(255,255,255,0.04)',
+                          opacity: unavailable ? 0.5 : 1,
                         }}>
                           <span style={{ width: 16, textAlign: 'right', fontSize: 10, color: 'rgba(255,255,255,0.4)', fontVariantNumeric: 'tabular-nums', flexShrink: 0 }}>{tk.trackNumber || ti + 1}</span>
                           <span style={{ flex: 1, minWidth: 0, fontSize: 11, color: 'rgba(255,255,255,0.88)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{tk.trackName}</span>
                           {tk.explicit ? <span style={{ fontSize: 7, fontWeight: 800, border: '1px solid rgba(255,255,255,0.28)', borderRadius: 3, padding: '0 3px', color: 'rgba(255,255,255,0.6)', flexShrink: 0 }}>E</span> : null}
+                          {unavailable ? <span style={{ fontSize: 7, fontWeight: 800, border: '1px solid rgba(255,255,255,0.18)', borderRadius: 3, padding: '0 3px', color: 'rgba(255,255,255,0.5)', flexShrink: 0, letterSpacing: '0.04em' }}>SOON</span> : null}
                           <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', fontVariantNumeric: 'tabular-nums', flexShrink: 0 }}>{fmtDur(tk.trackTimeMillis)}</span>
+                          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4, flexShrink: 0 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
+                          {tk.previewUrl ? (
+                            <button type="button"
+                              onClick={(e) => { e.stopPropagation(); togglePreview(r, tk); }}
+                              title={isPrev ? 'Stop preview' : 'Preview (30s)'} aria-label={isPrev ? 'Stop preview' : 'Play preview'}
+                              style={{
+                                width: 24, height: 24, borderRadius: '50%', flexShrink: 0, border: 'none', cursor: 'pointer',
+                                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                background: isPrev ? `rgba(${accent},0.85)` : 'rgba(255,255,255,0.08)', color: '#fff', transition: 'background 0.15s',
+                              }}>
+                              {isPrev ? (
+                                <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1" /><rect x="14" y="5" width="4" height="14" rx="1" /></svg>
+                              ) : (
+                                <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
+                              )}
+                            </button>
+                          ) : null}
+                          {inLib ? (
+                            <div title="Already in your library" aria-label="In library"
+                              style={{
+                                width: 24, height: 24, flexShrink: 0,
+                                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                color: '#8ae08a',
+                              }}>
+                              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+                            </div>
+                          ) : unavailable ? (
+                            <button type="button" disabled title="Not yet available" aria-label="Not yet available"
+                              style={{
+                                width: 24, height: 24, borderRadius: '50%', flexShrink: 0, border: 'none', cursor: 'default',
+                                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                background: 'rgba(255,255,255,0.06)', color: 'rgba(255,255,255,0.6)',
+                              }}>
+                              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></svg>
+                            </button>
+                          ) : (
                           <button type="button"
                             onClick={(e) => { e.stopPropagation(); if (!st || st === 'failed') downloadOneTrack(r, tk); }}
                             title={st || 'Download track'} aria-label="Download track"
@@ -430,6 +634,10 @@ function NewReleasesTab({
                               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 21h14" /></svg>
                             )}
                           </button>
+                          )}
+                          </div>
+                          {isPrev && previewVolumePosition === 'underButtons' ? renderVolBar(54) : null}
+                          </div>
                         </div>
                       );
                     })
@@ -443,18 +651,40 @@ function NewReleasesTab({
           })
         )}
       </div>
+       </>
+      ) : null}
 
-      {manageOpen ? createPortal(
+      {manageOpen ? (
         <FollowedArtistsManager
           followedArtists={followedArtists}
           followOverrides={followOverrides}
+          releases={releases}
           onAdd={onAddFollowedArtist}
           onExclude={onExcludeFollowedArtist}
           onClearOverride={onClearFollowedArtistOverride}
           onClose={() => setManageOpen(false)}
           accent={accent}
-        />,
-        document.body
+        />
+      ) : null}
+
+      {/* Floating preview-volume pill — shown while a preview is playing when
+          the user picked "Bottom right" in Settings. The inline under-buttons
+          bars are suppressed in this mode (see renderVolBar call sites). */}
+      {previewKey && previewVolumePosition === 'bottomRight' && !manageOpen ? (
+        <div style={{
+          position: 'absolute', right: 14, bottom: 14, zIndex: 6,
+          display: 'flex', alignItems: 'center', gap: 9,
+          padding: '8px 13px', borderRadius: 999,
+          background: 'rgba(18,18,22,0.88)',
+          border: '1px solid rgba(255,255,255,0.1)',
+          backdropFilter: 'blur(10px)', WebkitBackdropFilter: 'blur(10px)',
+          boxShadow: '0 4px 16px rgba(0,0,0,0.45)',
+        }}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.65)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+            <path d="M11 5L6 9H2v6h4l5 4V5z" /><path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+          </svg>
+          {renderVolBar(92)}
+        </div>
       ) : null}
     </div>
   );
@@ -470,6 +700,7 @@ function NewReleasesTab({
 function FollowedArtistsManager({
   followedArtists,
   followOverrides,
+  releases = [],
   onAdd,
   onExclude,
   onClearOverride,
@@ -483,9 +714,61 @@ function FollowedArtistsManager({
   const [debugData, setDebugData] = useState(null);
   const inputRef = useRef(null);
 
-  // Candidate disambiguation: as the user types, search iTunes for matching
-  // artists (enriched with art/genre/latest year) so they can pick the EXACT
-  // artist — fixing the "followed the wrong same-named artist" problem.
+  // Per-artist info derived from the cached releases so the list reads like the
+  // search results — cover thumbnail, genre, latest year, release count — which
+  // makes it obvious which same-named artist you actually follow.
+  const artistInfo = useMemo(() => {
+    const m = new Map(); // key (lowercased primary artist) → info
+    for (const r of releases || []) {
+      const key = (r.artistName || '').split(/,|feat\.|ft\.|&|\bx\b/i)[0].trim().toLowerCase();
+      if (!key) continue;
+      const year = r.releaseDate ? Number(String(r.releaseDate).slice(0, 4)) : 0;
+      const prev = m.get(key);
+      if (!prev) {
+        m.set(key, { artwork: r.artworkUrl || '', genre: r.primaryGenreName || '', latestYear: year || 0, count: 1, latestDate: r.releaseDate || '' });
+      } else {
+        prev.count += 1;
+        if (year && year > (prev.latestYear || 0)) prev.latestYear = year;
+        // Use the artwork from the most recent release.
+        if ((r.releaseDate || '') > (prev.latestDate || '')) { prev.artwork = r.artworkUrl || prev.artwork; prev.latestDate = r.releaseDate || prev.latestDate; }
+        if (!prev.genre && r.primaryGenreName) prev.genre = r.primaryGenreName;
+      }
+    }
+    return m;
+  }, [releases]);
+
+  // The cache-derived info above only covers artists with a release in the last
+  // ~30 days. Fetch real info from iTunes for everyone (genre, latest year,
+  // release count, artwork) so artists whose newest release is older — e.g. a
+  // 2025 album — don't show "No recent releases". Cached in the main process.
+  const [fetchedInfo, setFetchedInfo] = useState({}); // key → { genre, latestYear, releaseCount, artworkUrl }
+  const [infoLoading, setInfoLoading] = useState(false);
+  useEffect(() => {
+    const api = typeof window !== 'undefined' ? window.electronAPI : null;
+    if (!api?.getArtistInfo || !followedArtists.length) return undefined;
+    let cancelled = false;
+    setInfoLoading(true);
+    const payload = followedArtists.map((a) => ({ name: a.displayName, itunesArtistId: a.itunesArtistId || null }));
+    Promise.resolve(api.getArtistInfo(payload))
+      .then((r) => { if (!cancelled && r?.ok && r.info) setFetchedInfo(r.info); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setInfoLoading(false); });
+    return () => { cancelled = true; };
+  // Re-run when the set of followed artists changes (by key list).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [followedArtists.map((a) => a.key).join('|')]);
+
+  // Merge: prefer the freshly-fetched iTunes info, fall back to the cache-derived
+  // info, and normalize to one shape for rendering.
+  const infoFor = useCallback((a) => {
+    const f = fetchedInfo[a.key];
+    if (f && (f.latestYear || f.releaseCount || f.artworkUrl || f.genre)) {
+      return { artwork: f.artworkUrl || '', genre: f.genre || '', latestYear: f.latestYear || 0, count: f.releaseCount || 0 };
+    }
+    const c = artistInfo.get(a.key);
+    if (c) return { artwork: c.artwork || '', genre: c.genre || '', latestYear: c.latestYear || 0, count: c.count || 0 };
+    return null;
+  }, [fetchedInfo, artistInfo]);
   const [candidates, setCandidates] = useState([]);
   const [searching, setSearching] = useState(false);
   const [addedId, setAddedId] = useState(null); // artistId just followed (for ✓ feedback)
@@ -561,20 +844,25 @@ function FollowedArtistsManager({
     <div
       onMouseDown={(e) => { if (e.target === e.currentTarget) onClose?.(); }}
       style={{
-        position: 'fixed', inset: 0, zIndex: 200,
-        background: 'rgba(0,0,0,0.45)',
+        // We're INSIDE the dock, which already has its own backdrop-filter. A
+        // nested backdrop-filter samples an empty (black) backdrop and renders
+        // flat dark, so we DON'T use one here. Instead the dock has already
+        // frosted the app's cover into a soft ambient behind us; a light scrim +
+        // translucent card let that ambient bleed through, matching the look the
+        // Edit-metadata modal gets via its own glass (it lives outside the dock).
+        position: 'absolute', inset: 0, zIndex: 50,
+        background: 'rgba(0,0,0,0.18)',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
-        padding: 20,
+        padding: 12,
       }}>
       <div
         style={{
-          width: 'min(420px, 90vw)', maxHeight: '80vh', display: 'flex', flexDirection: 'column',
-          background: 'rgba(18,18,20,0.62)',
-          backdropFilter: 'blur(30px) saturate(1.6)',
-          WebkitBackdropFilter: 'blur(30px) saturate(1.6)',
-          border: '1px solid rgba(255,255,255,0.1)', borderRadius: 16,
+          width: '100%', maxWidth: 520, maxHeight: '100%',
+          display: 'flex', flexDirection: 'column', minHeight: 0,
+          borderRadius: 16, overflow: 'hidden',
+          background: 'rgba(18,18,20,0.45)',
+          border: '1px solid rgba(255,255,255,0.1)',
           boxShadow: '0 24px 60px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.07)',
-          overflow: 'hidden',
         }}>
         {/* Header */}
         <div style={{
@@ -635,7 +923,13 @@ function FollowedArtistsManager({
           {candidates.length > 0 ? (
             <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 3, maxHeight: 248, overflowY: 'auto' }}>
               {candidates.map((c) => {
-                const already = followedArtists.some((a) => (a.key || a.displayName || '').toLowerCase() === c.artistName.toLowerCase());
+                const already = followedArtists.some((a) => {
+                  // If we've pinned this followed artist to a specific iTunes ID,
+                  // only the matching candidate counts as "Following" — otherwise
+                  // every artist sharing the name lights up.
+                  if (a.itunesArtistId && c.artistId) return Number(a.itunesArtistId) === Number(c.artistId);
+                  return (a.key || a.displayName || '').toLowerCase() === c.artistName.toLowerCase();
+                });
                 const justAdded = addedId === c.artistId;
                 return (
                   <button key={c.artistId} type="button"
@@ -685,16 +979,36 @@ function FollowedArtistsManager({
           ) : null}
           {followedArtists.map((a) => {
             const manual = isManual(a);
+            const info = infoFor(a);
+            const sub = info
+              ? [info.genre, info.latestYear ? `latest ${info.latestYear}` : '', info.count ? `${info.count} release${info.count === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ')
+              : '';
             return (
               <div key={a.key}
                 style={{
-                  display: 'flex', alignItems: 'center', gap: 8,
-                  padding: '6px 16px', fontSize: 11.5,
+                  display: 'flex', alignItems: 'center', gap: 10,
+                  padding: '7px 16px', fontSize: 11.5,
                 }}>
-                <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  <span style={{ color: '#fff', fontWeight: 500 }}>{a.displayName}</span>
-                  <span style={{ color: 'rgba(255,255,255,0.35)', fontSize: 9.5, marginLeft: 6, letterSpacing: '0.04em', textTransform: 'uppercase' }}>
-                    {manual ? 'Manual' : 'Auto'}
+                <span style={{
+                  width: 38, height: 38, borderRadius: 7, flexShrink: 0,
+                  background: '#1a1a1a', backgroundImage: info?.artwork ? `url(${info.artwork})` : 'none',
+                  backgroundSize: 'cover', backgroundPosition: 'center',
+                  boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                }}>
+                  {!info?.artwork ? (
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.3)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="8" r="4" /><path d="M5 21v-1a7 7 0 0 1 14 0v1" /></svg>
+                  ) : null}
+                </span>
+                <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                    <span style={{ color: '#fff', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.displayName}</span>
+                    <span style={{ color: 'rgba(255,255,255,0.32)', fontSize: 9, letterSpacing: '0.05em', textTransform: 'uppercase', flexShrink: 0 }}>
+                      {manual ? 'Manual' : 'Auto'}
+                    </span>
+                  </div>
+                  <span style={{ color: 'rgba(255,255,255,0.45)', fontSize: 10, marginTop: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {sub || (infoLoading ? 'Loading…' : 'No recent releases')}
                   </span>
                 </div>
                 <button type="button"
@@ -703,7 +1017,7 @@ function FollowedArtistsManager({
                   style={{
                     padding: '3px 10px', borderRadius: 999, border: '1px solid rgba(255,255,255,0.12)',
                     background: 'transparent', color: 'rgba(255,255,255,0.6)',
-                    fontSize: 10, fontWeight: 600, cursor: 'pointer',
+                    fontSize: 10, fontWeight: 600, cursor: 'pointer', flexShrink: 0,
                   }}
                   onMouseEnter={(e) => { e.currentTarget.style.color = '#f37272'; e.currentTarget.style.borderColor = 'rgba(243,114,114,0.4)'; }}
                   onMouseLeave={(e) => { e.currentTarget.style.color = 'rgba(255,255,255,0.6)'; e.currentTarget.style.borderColor = 'rgba(255,255,255,0.12)'; }}>

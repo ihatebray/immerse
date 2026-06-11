@@ -119,11 +119,12 @@ function Tooltip({ label, children, side = 'auto', delay = 400 }) {
  *   max        — upper bound. If 0 / falsy, the slider becomes inert.
  *   onChange   — fn(newValue) called continuously during drag and on click.
  *                Called as the user drags so audio/volume tracks the cursor.
- *   accent     — RGB string used to tint the filled portion + heart.
+ *   accent     — RGB string used to tint the filled portion + thumb.
  *   ariaLabel  — accessibility label
- *   thumbSize  — heart width/height in px (default 12)
+ *   thumbSize  — thumb width/height in px (default 12)
+ *   thumbShape — either 'heart' or 'circle'; the heart is the default.
  */
-function HeartSlider({ value = 0, max = 0, onChange, accent = '255, 255, 255', ariaLabel = 'Slider', thumbSize = 12 }) {
+function HeartSlider({ value = 0, max = 0, onChange, accent = '255, 255, 255', ariaLabel = 'Slider', thumbSize = 12, thumbShape = 'heart' }) {
   const trackRef = useRef(null);
   const [hovered, setHovered] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -245,11 +246,16 @@ function HeartSlider({ value = 0, max = 0, onChange, accent = '255, 255, 255', a
           width={thumbSize} height={thumbSize}
           viewBox="0 0 24 24"
           fill={dragging ? `rgb(${accent})` : '#fff'}
+          stroke={thumbShape === 'circle' ? 'rgba(255,255,255,0.7)' : 'none'}
+          strokeWidth={thumbShape === 'circle' ? 1.5 : 0}
           aria-hidden
           style={{ display: 'block' }}
         >
-          {/* Classic heart path */}
-          <path d="M12 21s-7-4.35-9.5-8.5C.92 9.4 2.18 5 6 5c2.04 0 3.4 1.13 4.5 2.5C11.6 6.13 12.96 5 15 5c3.82 0 5.08 4.4 3.5 7.5C19 16.65 12 21 12 21z" />
+          {thumbShape === 'circle' ? (
+            <circle cx="12" cy="12" r="8" />
+          ) : (
+            <path d="M12 21s-7-4.35-9.5-8.5C.92 9.4 2.18 5 6 5c2.04 0 3.4 1.13 4.5 2.5C11.6 6.13 12.96 5 15 5c3.82 0 5.08 4.4 3.5 7.5C19 16.65 12 21 12 21z" />
+          )}
         </svg>
       </div>
     </div>

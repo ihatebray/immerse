@@ -198,6 +198,25 @@ function LibraryTab({
     });
   }, [twoPaneEnabled, twoPaneArtist, displayTracks]);
 
+  // Decide how a clicked song should seed the queue:
+  //   'list'   — queue the whole visible group (artist pane, or a search that
+  //              resolves to a single artist/album, or the unfiltered library).
+  //   'single' — the search is a grab-bag of unrelated songs, so play just the
+  //              clicked track and let the queue continue randomly afterward.
+  const songsPlayContext = useMemo(() => {
+    if (twoPaneArtist) return 'list';           // explicit artist selection
+    if (!search || !search.trim()) return 'list'; // whole library
+    const list = twoPaneFilteredTracks;
+    if (list.length <= 1) return 'single';
+    const primary = (t) => (t.artist || '').split(/[,&]/)[0].trim().toLowerCase();
+    const artists = new Set(list.map(primary));
+    const albums = new Set(list.map((t) => (t.album || '').toLowerCase()).filter(Boolean));
+    // All results share one artist (artist search) or one album (album search).
+    if (artists.size === 1) return 'list';
+    if (albums.size === 1 && albums.size > 0) return 'list';
+    return 'single';
+  }, [twoPaneArtist, search, twoPaneFilteredTracks]);
+
   // Reset selected artist if it disappears from the list (e.g. user
   // edits a track or deletes the artist's last track).
   useEffect(() => {
@@ -559,6 +578,7 @@ function LibraryTab({
               ) : null}
               <VirtualTrackList
                 tracks={twoPaneFilteredTracks}
+                playContext={songsPlayContext}
                 currentTrack={currentTrack}
                 isPlaying={isPlaying}
                 selectedId={selectedId}
@@ -1095,6 +1115,7 @@ function AlphaRail({ alphaIndex, reverse = false, onJump, accent }) {
 
 function VirtualTrackList({
   tracks,
+  playContext = 'list',
   currentTrack,
   isPlaying,
   selectedId,
@@ -1248,7 +1269,7 @@ function VirtualTrackList({
             onMouseEnter={() => setHovered(track.id)}
             onMouseLeave={() => setHovered(null)}
             onClick={() => setSelectedId(track.id)}
-            onDoubleClick={() => onPlayTrack(track)}
+            onDoubleClick={() => onPlayTrack(track, tracks, playContext)}
             onContextMenu={onTrackContextMenu ? (e) => onTrackContextMenu(e, track) : undefined}
             style={{
               display: 'grid', gridTemplateColumns: '22px 36px 1fr auto',
@@ -1261,7 +1282,7 @@ function VirtualTrackList({
             <div style={{ width: 22, height: 22, display: 'flex', alignItems: 'center', justifyContent: 'center', color: isCur ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.38)', fontSize: 11, fontWeight: 500, fontVariantNumeric: 'tabular-nums' }}>
               {(isHov || isCur) ? (
                 <button type="button" title={isCur && isPlaying ? 'Pause' : 'Play'}
-                  onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); (onPlayPauseTrack || onPlayTrack)(track); }}
+                  onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); (onPlayPauseTrack || onPlayTrack)(track, tracks, playContext); }}
                   style={{ width: 20, height: 20, border: 'none', background: 'transparent', color: '#fff', cursor: 'pointer', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                   <span style={{ transform: 'scale(0.72)' }}>{isCur && isPlaying ? <Icons.Pause /> : <Icons.Play />}</span>
                 </button>

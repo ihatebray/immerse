@@ -855,6 +855,7 @@ function SideDock({
   accent,
   spotifyCredsRefreshKey,
   onSpotifyImportDone,
+  onPreviewPlay,
   onSpotifyCredsSaved,
   uiFontId,
   onSetUiFontId,
@@ -886,6 +887,10 @@ function SideDock({
   onSetQueuePainterEnabled,
   recentlyPlayedEnabled = true,
   onSetRecentlyPlayedEnabled,
+  previewVolumePosition = 'bottomRight',
+  onSetPreviewVolumePosition,
+  nowPlayingSliderStyle = 'circle',
+  onSetNowPlayingSliderStyle,
   onShowOnboarding,
   firstTimeSparkleEnabled = false,
   onSetFirstTimeSparkleEnabled,
@@ -1293,6 +1298,8 @@ function SideDock({
             accent={accent}
             onShowCandidatePicker={onShowCandidatePicker}
             onSpotifyImportDone={onSpotifyImportDone}
+            onPreviewPlay={onPreviewPlay}
+            previewVolumePosition={previewVolumePosition}
           />
         ) : tab === 'settings' ? (
           <SettingsTab
@@ -1313,6 +1320,10 @@ function SideDock({
             onSetHiddenTabIds={onSetHiddenTabIds}
             dockCollapseAnimationEnabled={dockCollapseAnimationEnabled}
             onSetDockCollapseAnimationEnabled={onSetDockCollapseAnimationEnabled}
+            previewVolumePosition={previewVolumePosition}
+            onSetPreviewVolumePosition={onSetPreviewVolumePosition}
+            nowPlayingSliderStyle={nowPlayingSliderStyle}
+            onSetNowPlayingSliderStyle={onSetNowPlayingSliderStyle}
             randomButtonEnabled={randomButtonEnabled}
             onSetRandomButtonEnabled={onSetRandomButtonEnabled}
             breathingDockPillEnabled={breathingDockPillEnabled}

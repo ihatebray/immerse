@@ -67,6 +67,10 @@ export default function ImmersiveLibraryPage({
   isMaximized = false,
   onImportFiles,
   onImportFolder,
+  previewVolumePosition = 'bottomRight',
+  onSetPreviewVolumePosition,
+  nowPlayingSliderStyle = 'circle',
+  onSetNowPlayingSliderStyle,
   onSpotifyImportDone,
   onRemoveFromLibrary,
   onUpdateTrackMetadata,
@@ -494,6 +498,7 @@ export default function ImmersiveLibraryPage({
         ? lyricsData.synced.map((l) => l.text).join('\n')
         : (lyricsData.plain || ''))
     : '';
+  const appliedLyricId = lyricsData?.lyricId ?? null;
 
   /**
    * Re-fetch lyrics for the currently-playing track. Clears the
@@ -565,28 +570,22 @@ export default function ImmersiveLibraryPage({
   // when the user plays a song while a search is active, so playback continues
   // through the whole library instead of dead-ending after the filtered
   // results. The clicked track is passed separately, so it still plays first.
-  const fullSortedLibrary = useMemo(() => {
-    const base = [...library];
-    base.sort((a, b) => titleCollator.compare(String(a.title || ''), String(b.title || ''))
-      || titleCollator.compare(String(a.id), String(b.id)));
-    return base;
-  }, [library]);
+  // Wrap play callbacks to pass the visible track list (so the queue matches
+  // what's on screen) AND the play context. 'single' (a one-off song search)
+  // plays the track then continues with a random shuffle of the library
+  // (handled in App.playTrack); 'list' queues the visible group; an explicit
+  // overrideList (album view) wins.
+  const sortedPlayTrack = useCallback((track, overrideList, context = 'list') => {
+    if (context === 'single') { onPlayTrack(track, null, 'single'); return; }
+    const queue = overrideList && overrideList.length > 0 ? overrideList : tracks;
+    onPlayTrack(track, queue, 'list');
+  }, [onPlayTrack, tracks]);
 
-  const searchActive = search.trim().length > 0;
-
-  // Wrap play callbacks to pass the sorted track list so the queue matches visible order.
-  // An explicit overrideList (e.g. from album view) takes priority. When a search is
-  // active, queue the FULL library (not just filtered results) so playback continues
-  // past the matches instead of dead-ending; the clicked track still plays first.
-  const sortedPlayTrack = useCallback((track, overrideList) => {
-    const queue = overrideList && overrideList.length > 0 ? overrideList : (searchActive ? fullSortedLibrary : tracks);
-    onPlayTrack(track, queue);
-  }, [onPlayTrack, tracks, fullSortedLibrary, searchActive]);
-
-  const sortedPlayPauseTrack = useCallback((track, overrideList) => {
-    const queue = overrideList && overrideList.length > 0 ? overrideList : (searchActive ? fullSortedLibrary : tracks);
-    onPlayPauseTrack(track, queue);
-  }, [onPlayPauseTrack, tracks, fullSortedLibrary, searchActive]);
+  const sortedPlayPauseTrack = useCallback((track, overrideList, context = 'list') => {
+    if (context === 'single') { onPlayPauseTrack(track, null, 'single'); return; }
+    const queue = overrideList && overrideList.length > 0 ? overrideList : tracks;
+    onPlayPauseTrack(track, queue, 'list');
+  }, [onPlayPauseTrack, tracks]);
 
   const focusTrack = useMemo(() => {
     if (currentTrack && library.some((t) => t.id === currentTrack.id)) return currentTrack;
@@ -941,7 +940,7 @@ export default function ImmersiveLibraryPage({
     }
     // If the track changed during the save round-trip, don't stomp the new one.
     if (lyricsReqRef.current !== reqId) return;
-    const data = { synced, plain, instrumental: false };
+    const data = { synced, plain, instrumental: false, lyricId: candidate.id ?? null };
     lyricsCacheRef.current.set(currentTrack.id, data);
     setLyricsData(data);
     setLyricsTrackId(currentTrack.id);
@@ -1208,6 +1207,7 @@ export default function ImmersiveLibraryPage({
           onPlayTrack={onPlayPauseTrack}
           accent={accent}
           onSpotifyImportDone={onSpotifyImportDone}
+          onPreviewPlay={() => { if (isPlaying) onTogglePlay?.(); }}
           followedReleases={releases}
           trackOfMomentEnabled={trackOfMomentEnabled}
           playEvents={playEvents}
@@ -1459,6 +1459,7 @@ export default function ImmersiveLibraryPage({
               accent={accent}
               ariaLabel="Seek"
               thumbSize={13}
+              thumbShape={nowPlayingSliderStyle}
             />
             <span style={{
               color: 'rgba(255,255,255,0.55)', fontSize: 10.5, fontVariantNumeric: 'tabular-nums',
@@ -1529,6 +1530,7 @@ export default function ImmersiveLibraryPage({
               accent={accent}
               ariaLabel="Volume"
               thumbSize={11}
+              thumbShape={nowPlayingSliderStyle}
             />
             <BoostButton
               boost={gainBoost}
@@ -1724,6 +1726,7 @@ export default function ImmersiveLibraryPage({
               visible={lyricsPanelHovered}
               onApply={handlePickLyrics}
               appliedText={appliedLyricText}
+              appliedId={appliedLyricId}
             />
           ) : null}
 
@@ -1928,6 +1931,11 @@ export default function ImmersiveLibraryPage({
         coverFullscreenEnabled={coverFullscreenEnabled}
         onSetCoverFullscreenEnabled={onSetCoverFullscreenEnabled}
         pinnableTabsEnabled={pinnableTabsEnabled}
+        previewVolumePosition={previewVolumePosition}
+        onSetPreviewVolumePosition={onSetPreviewVolumePosition}
+        onPreviewPlay={() => { if (isPlaying) onTogglePlay?.(); }}
+        nowPlayingSliderStyle={nowPlayingSliderStyle}
+        onSetNowPlayingSliderStyle={onSetNowPlayingSliderStyle}
         onSetPinnableTabsEnabled={onSetPinnableTabsEnabled}
         hiddenTabIds={hiddenTabIds}
         onSetHiddenTabIds={onSetHiddenTabIds}
@@ -2160,6 +2168,7 @@ export default function ImmersiveLibraryPage({
           repeat={repeat}
           volume={volume}
           onSetVolume={onSetVolume}
+          nowPlayingSliderStyle={nowPlayingSliderStyle}
           onTogglePlay={onTogglePlay}
           onPrev={onPrev}
           onNext={onNext}
