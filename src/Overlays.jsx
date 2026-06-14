@@ -1,18 +1,49 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Shuffle, Repeat, Repeat1 } from 'lucide-react';
 import Icons from './Icons.jsx';
 import { formatTime } from './mediaUtils.js';
-import { HeartSlider, MediaPlayPauseBtn, MediaToggleBtn, MediaSkipBtn } from './sharedUI.jsx';
+import { HeartSlider } from './sharedUI.jsx';
 import { SyncedLyrics, PlainLyrics } from './Lyrics.jsx';
+import { AnimatedGradientBg } from './VisualEffects.jsx';
+
+/** Compact dock-scale control button for the fullscreen pill. The shared
+ * MediaPlayPauseBtn/MediaSkipBtn are 56/40px — sized for the now-playing
+ * page — so the pill uses these 28px equivalents instead. `emphasized`
+ * gives play/pause a subtle filled chip so it reads as the primary action
+ * without ballooning the pill. */
+function FsDockBtn({ children, onClick, title, active = false, emphasized = false }) {
+  const [hov, setHov] = useState(false);
+  return (
+    <button type="button" onClick={onClick} title={title} aria-label={title}
+      onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}
+      style={{
+        width: emphasized ? 32 : 28, height: emphasized ? 32 : 28,
+        borderRadius: emphasized ? '50%' : 8, border: 'none', padding: 0,
+        background: 'transparent',
+        color: emphasized
+          ? (hov ? '#fff' : 'rgba(255,255,255,0.85)')
+          : (active ? '#fff' : hov ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.6)'),
+        cursor: 'pointer', display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+        transition: 'color 0.15s, transform 0.15s',
+        transform: emphasized && hov ? 'scale(1.08)' : 'scale(1)',
+        flexShrink: 0,
+      }}>
+      {children}
+    </button>
+  );
+}
 
 function CoverFullscreenOverlay({
-  coverUrl, title, artist, album, accent,
+  coverUrl, title, artist, album, accent, mid, wash,
   isPlaying = false, currentTime = 0, duration = 0,
   shuffleOn = false, repeat = 'off',
   volume = 1, onSetVolume,
   nowPlayingSliderStyle = 'circle',
   onTogglePlay, onPrev, onNext, onSeek, onToggleShuffle, onToggleRepeat,
   lyricsData = null, hasSyncedLyrics = false, hasPlainLyrics = false,
+  analyserRef = null, beatReactive = false,
+  fullscreenLyricsMode = 'side',
+  onSetFullscreenLyricsMode,
   onClose,
 }) {
   const dialogRef = useRef(null);
@@ -20,6 +51,67 @@ function CoverFullscreenOverlay({
   // Honour the OS "reduce motion" setting — skip the entrance/scale animations.
   const reduceMotion = typeof window !== 'undefined' && window.matchMedia
     && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // Backdrop: 'cover' = blurred album art (beat-pulsed), 'field' = the same
+  // animated colour field the now-playing page uses. Persisted locally.
+  const [backdropMode, setBackdropMode] = useState(() => {
+    try { return window.localStorage.getItem('immerse:fullscreenBackdrop') === 'field' ? 'field' : 'cover'; } catch { return 'cover'; }
+  });
+  const setBackdrop = useCallback((m) => {
+    setBackdropMode(m);
+    try { window.localStorage.setItem('immerse:fullscreenBackdrop', m); } catch { /* ignore */ }
+  }, []);
+
+  // ---- Beat-reactive backdrop ------------------------------------------
+  // Mirrors AnimatedGradientBg's envelope: average the bass bins, climb fast
+  // on hits, decay slowly. The envelope drives the blurred-cover backdrop's
+  // brightness/saturation and a slight scale swell — applied directly to the
+  // DOM node from a rAF loop so the pulse never triggers React re-renders.
+  const backdropRef = useRef(null);
+  const beatEnvRef = useRef(0);
+  const freqBufRef = useRef(null);
+  const beatStateRef = useRef({ beatReactive, isPlaying });
+  useEffect(() => { beatStateRef.current = { beatReactive, isPlaying }; }, [beatReactive, isPlaying]);
+  useEffect(() => {
+    if (!beatReactive || reduceMotion || backdropMode !== 'cover') return undefined;
+    let raf = 0;
+    const frame = () => {
+      const node = backdropRef.current;
+      const { beatReactive: br, isPlaying: ip } = beatStateRef.current;
+      const analyser = analyserRef?.current;
+      let beat;
+      if (br && ip && analyser) {
+        if (!freqBufRef.current || freqBufRef.current.length !== analyser.frequencyBinCount) {
+          freqBufRef.current = new Uint8Array(analyser.frequencyBinCount);
+        }
+        analyser.getByteFrequencyData(freqBufRef.current);
+        const bins = freqBufRef.current;
+        const N = Math.min(50, bins.length);
+        let sum = 0;
+        for (let i = 0; i < N; i++) sum += bins[i];
+        const avg = (sum / N) / 255;
+        const env = beatEnvRef.current;
+        beat = avg > env ? env + (avg - env) * 0.45 : env + (avg - env) * 0.06;
+      } else {
+        beat = beatEnvRef.current * 0.92;
+      }
+      beatEnvRef.current = beat;
+      if (node) {
+        node.style.filter = `blur(90px) saturate(${(1.5 + beat * 0.7).toFixed(3)}) brightness(${(0.5 + beat * 0.3).toFixed(3)})`;
+        node.style.transform = `scale(${(1 + beat * 0.05).toFixed(4)})`;
+      }
+      raf = requestAnimationFrame(frame);
+    };
+    raf = requestAnimationFrame(frame);
+    return () => {
+      cancelAnimationFrame(raf);
+      const node = backdropRef.current;
+      if (node) {
+        node.style.filter = 'blur(90px) saturate(1.5) brightness(0.5)';
+        node.style.transform = 'scale(1)';
+      }
+    };
+  }, [beatReactive, reduceMotion, analyserRef, backdropMode]);
 
   // Idle auto-hide: after a few seconds with no mouse/key activity, fade out
   // the controls + cursor so the cover sits as clean ambient art. Any movement
@@ -49,13 +141,15 @@ function CoverFullscreenOverlay({
   // the rail (which is vertically centered) smoothly re-centers the cover +
   // title. The max-height transition animates that motion. maxHeight when open
   // is comfortably above the real content height so nothing clips.
-  const controlsFade = {
-    width: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center',
-    overflow: 'hidden',
+  // The control bar is a floating overlay pinned to the bottom edge — it
+  // fades and sinks away on idle. Crucially it is NOT part of the centered
+  // composition, so the cover/title never move; fullscreen reads as art with
+  // controls hovering over it, not a player page.
+  const barFade = {
     opacity: idle ? 0 : 1,
-    maxHeight: idle ? 0 : 240,
+    transform: idle ? 'translateY(14px)' : 'translateY(0)',
     pointerEvents: idle ? 'none' : 'auto',
-    transition: 'opacity 0.4s ease, max-height 0.5s cubic-bezier(0.4,0,0.2,1)',
+    transition: 'opacity 0.4s ease, transform 0.45s cubic-bezier(0.2,0.7,0.2,1)',
   };
 
   // Keyboard control while the overlay has focus. We only act when focus is on
@@ -96,48 +190,98 @@ function CoverFullscreenOverlay({
         e.preventDefault(); e.stopPropagation(); onSetVolume?.(Math.min(1, vol + 0.05)); break;
       case 'ArrowDown':
         e.preventDefault(); e.stopPropagation(); onSetVolume?.(Math.max(0, vol - 0.05)); break;
+      case 'l': case 'L':
+        if (flipMode) { e.preventDefault(); e.stopPropagation(); setFlipped((f) => !f); }
+        break;
       case 'm': case 'M':
         e.preventDefault(); e.stopPropagation(); onSetVolume?.(vol > 0 ? 0 : 1); break;
       default: break; // Esc / f bubble up to the parent
     }
   };
 
+  // Two lyric presentations, user-selectable in Settings:
+  //  'side' — a chrome-free lyrics column floats beside the cover, sized to
+  //           the cover's height, scrolling with the song.
+  //  'flip' — the composition stays untouched; pressing L (or clicking the
+  //           cover) flips the artwork over to a same-size lyric card.
   const hasAnyLyrics = hasSyncedLyrics || hasPlainLyrics;
+  const sideLyrics = fullscreenLyricsMode === 'side' && hasAnyLyrics;
+  const flipMode = fullscreenLyricsMode === 'flip' && hasAnyLyrics;
+  const [flipped, setFlipped] = useState(false);
+  // Un-flip when the track changes or the mode stops supporting it.
+  useEffect(() => { setFlipped(false); }, [title, flipMode]);
 
-  // The cover/controls rail. Reused whether or not lyrics exist — when there
-  // are no lyrics it simply centers in the screen on its own.
+  // The cover/controls rail — always the centered, chrome-free composition.
   const rail = (
     <div style={{
       display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
       gap: 0, padding: '40px 36px',
       flexShrink: 0,
-      width: hasAnyLyrics ? 'clamp(320px, 34vw, 460px)' : 'auto',
-      ...(hasAnyLyrics ? {
-        background: 'rgba(255,255,255,0.045)',
-        borderRight: '1px solid rgba(255,255,255,0.08)',
-        backdropFilter: 'blur(28px) saturate(1.3)',
-        WebkitBackdropFilter: 'blur(28px) saturate(1.3)',
-        height: '100%',
-      } : {}),
     }}>
-      {/* Cover */}
-      <div style={{
-        position: 'relative',
-        width: hasAnyLyrics ? 'min(26vw, 300px)' : 'min(58vh, 46vw)',
-        aspectRatio: '1', borderRadius: 16, overflow: 'hidden',
-        boxShadow: `0 24px 70px rgba(0,0,0,0.55), 0 0 0 1px rgba(${accent},0.4)`,
-        background: '#111',
-        animation: reduceMotion ? 'none' : 'immerseFullscreenCoverIn 300ms cubic-bezier(0.2,0.7,0.2,1)',
-      }}>
-        {coverUrl ? (
-          <img src={coverUrl} alt={title ? `Cover for ${title}` : 'Cover art'}
-            decoding="async" draggable={false}
-            style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', imageRendering: 'high-quality' }} />
-        ) : (
-          <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#444' }}>
-            <Icons.AlbumSidebar />
+      {/* Cover — in flip mode it's a two-sided card: artwork on the front,
+          lyrics on the back, rotating on L / click. In side mode it shrinks
+          a touch so cover + lyrics column fit as one centered pair. */}
+      <div
+        onClick={flipMode ? (e) => { e.stopPropagation(); setFlipped((f) => !f); } : undefined}
+        title={flipMode ? (flipped ? 'Show cover (L)' : 'Show lyrics (L)') : undefined}
+        style={{
+          position: 'relative',
+          width: sideLyrics ? 'min(52vh, 42vw)' : 'min(58vh, 46vw)',
+          aspectRatio: '1',
+          perspective: 1400,
+          cursor: flipMode ? 'pointer' : 'default',
+          animation: reduceMotion ? 'none' : 'immerseFullscreenCoverIn 300ms cubic-bezier(0.2,0.7,0.2,1)',
+        }}>
+        <div style={{
+          position: 'absolute', inset: 0,
+          transformStyle: 'preserve-3d',
+          transform: flipped ? 'rotateY(180deg)' : 'rotateY(0deg)',
+          transition: reduceMotion ? 'none' : 'transform 0.6s cubic-bezier(0.3,0.7,0.25,1)',
+        }}>
+          {/* Front: artwork.
+              Rendered as a background-image (not an <img object-fit:cover>)
+              on purpose. When this overlay opens from the now-playing page,
+              the new <img> would be handed an already-decoded/cached bitmap
+              and Chromium paints it once at the image's intrinsic ratio
+              before object-fit:cover takes effect — so non-square covers
+              showed bars until a track change forced a fresh load + relayout.
+              background-size:cover is computed from the box immediately and
+              has no such cached-image quirk (it's how every cover tile in the
+              app already renders). */}
+          <div style={{
+            position: 'absolute', inset: 0, borderRadius: 16, overflow: 'hidden',
+            boxShadow: `0 24px 70px rgba(0,0,0,0.55), 0 0 0 1px rgba(${accent},0.4)`,
+            background: '#111',
+            backgroundImage: coverUrl ? `url("${coverUrl}")` : 'none',
+            backgroundSize: 'cover', backgroundPosition: 'center', backgroundRepeat: 'no-repeat',
+            backfaceVisibility: 'hidden', WebkitBackfaceVisibility: 'hidden',
+          }}>
+            {!coverUrl ? (
+              <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#444' }}>
+                <Icons.AlbumSidebar />
+              </div>
+            ) : null}
           </div>
-        )}
+          {/* Back: lyric card (flip mode only) */}
+          {flipMode ? (
+            <div onClick={(e) => e.stopPropagation()} style={{
+              position: 'absolute', inset: 0, borderRadius: 16, overflow: 'hidden',
+              transform: 'rotateY(180deg)',
+              backfaceVisibility: 'hidden', WebkitBackfaceVisibility: 'hidden',
+              background: 'rgba(16,16,19,0.78)',
+              backdropFilter: 'blur(30px) saturate(1.4)', WebkitBackdropFilter: 'blur(30px) saturate(1.4)',
+              border: '1px solid rgba(255,255,255,0.1)',
+              boxShadow: `0 24px 70px rgba(0,0,0,0.55), 0 0 0 1px rgba(${accent},0.35)`,
+              padding: '26px 26px', display: 'flex', flexDirection: 'column', cursor: 'default',
+            }}>
+              {hasSyncedLyrics ? (
+                <SyncedLyrics lines={lyricsData.synced} currentTime={currentTime} accent={accent} onSeek={onSeek} fontSize={16} lineHeight={1.5} />
+              ) : (
+                <PlainLyrics text={lyricsData.plain} fontSize={15} lineHeight={1.65} accent={accent} />
+              )}
+            </div>
+          ) : null}
+        </div>
       </div>
 
       {/* Title / artist / album */}
@@ -156,73 +300,6 @@ function CoverFullscreenOverlay({
           </div>
         ) : null}
       </div>
-
-      {/* Controls (seek + transport + volume) — collapse + fade when idle so
-          the cover re-centers smoothly */}
-      <div style={controlsFade}>
-      {/* Seek */}
-      <div style={{ width: '100%', maxWidth: 380, marginTop: 20, display: 'flex', alignItems: 'center', gap: 9 }}>
-        <span style={{ color: 'rgba(255,255,255,0.55)', fontSize: 10, fontVariantNumeric: 'tabular-nums', minWidth: 32, textAlign: 'right' }}>{formatTime(currentTime)}</span>
-        <HeartSlider value={currentTime} max={duration || 0} onChange={(v) => onSeek?.(v)} accent={accent} ariaLabel="Seek" thumbSize={12} thumbShape={nowPlayingSliderStyle} />
-        <span style={{ color: 'rgba(255,255,255,0.55)', fontSize: 10, fontVariantNumeric: 'tabular-nums', minWidth: 32 }}>{formatTime(duration)}</span>
-      </div>
-
-      {/* Transport — same MediaSkipBtn/MediaPlayPauseBtn controls as the dock */}
-      <div style={{ marginTop: 16, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 'clamp(18px, 2.4vmin, 26px)' }}>
-        <MediaToggleBtn onClick={onToggleShuffle} title="Shuffle" active={shuffleOn}>
-          <Shuffle size={20} strokeWidth={2} />
-        </MediaToggleBtn>
-        <MediaSkipBtn onClick={onPrev} title="Previous">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M17 4L7 12l10 8" />
-          </svg>
-        </MediaSkipBtn>
-        <MediaPlayPauseBtn onClick={onTogglePlay} isPlaying={isPlaying} />
-        <MediaSkipBtn onClick={onNext} title="Next">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M7 4l10 8-10 8" />
-          </svg>
-        </MediaSkipBtn>
-        <MediaToggleBtn onClick={onToggleRepeat} title={`Repeat: ${repeat}`} active={repeat !== 'off'}>
-          {repeat === 'one' ? (
-            <Repeat1 size={20} strokeWidth={2} />
-          ) : (
-            <Repeat size={20} strokeWidth={2} />
-          )}
-        </MediaToggleBtn>
-      </div>
-
-      {/* Volume — compact, centered */}
-      {onSetVolume ? (
-        <div style={{ width: '100%', maxWidth: 210, marginTop: 18, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
-          <button type="button" onClick={() => onSetVolume?.(volume > 0 ? 0 : 1)}
-            title={volume > 0 ? 'Mute (M)' : 'Unmute (M)'}
-            aria-label={volume > 0 ? 'Mute' : 'Unmute'}
-            style={{
-              flexShrink: 0, width: 30, height: 30, borderRadius: 8, border: 'none', padding: 0,
-              background: 'transparent', color: 'rgba(255,255,255,0.6)', cursor: 'pointer',
-              display: 'inline-flex', alignItems: 'center', justifyContent: 'center', transition: 'color 0.15s',
-            }}
-            onMouseEnter={(e) => { e.currentTarget.style.color = '#fff'; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = 'rgba(255,255,255,0.6)'; }}>
-            {volume <= 0 ? (
-              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M11 5L6 9H2v6h4l5 4V5z" /><line x1="23" y1="9" x2="17" y2="15" /><line x1="17" y1="9" x2="23" y2="15" />
-              </svg>
-            ) : volume < 0.5 ? (
-              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M11 5L6 9H2v6h4l5 4V5z" /><path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
-              </svg>
-            ) : (
-              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M11 5L6 9H2v6h4l5 4V5z" /><path d="M15.54 8.46a5 5 0 0 1 0 7.07" /><path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
-              </svg>
-            )}
-          </button>
-          <HeartSlider value={volume} max={1} onChange={(v) => onSetVolume?.(v)} accent={accent} ariaLabel="Volume" thumbSize={11} thumbShape={nowPlayingSliderStyle} />
-        </div>
-      ) : null}
-      </div>
     </div>
   );
 
@@ -230,7 +307,7 @@ function CoverFullscreenOverlay({
     <div
       ref={dialogRef} role="dialog" aria-modal="true"
       aria-label={`${title || 'Now playing'} — fullscreen`} tabIndex={-1}
-      onClick={onClose} onKeyDown={handleKey} onMouseMove={bumpActivity}
+      onKeyDown={handleKey} onMouseMove={bumpActivity}
       style={{
         position: 'fixed', inset: 0, zIndex: 120,
         // Sit ABOVE the app's window-drag title bar (z-index 99) and window
@@ -240,6 +317,9 @@ function CoverFullscreenOverlay({
         // re-enables dragging the window.
         WebkitAppRegion: 'no-drag',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
+        // Constant bottom reserve so the centered composition clears the
+        // floating dock pill. Never idle-dependent — the art doesn't move.
+        paddingBottom: '9vh',
         background: '#000', animation: reduceMotion ? 'none' : 'immerseFullscreenIn 220ms ease-out', outline: 'none',
         cursor: idle ? 'none' : 'default',
       }}
@@ -248,20 +328,33 @@ function CoverFullscreenOverlay({
         @keyframes immerseFullscreenIn { 0% { opacity: 0; } 100% { opacity: 1; } }
         @keyframes immerseFullscreenCoverIn { 0% { opacity: 0; transform: scale(0.96) translateY(8px); } 100% { opacity: 1; transform: scale(1) translateY(0); } }
         @keyframes immerseFullscreenLyricsIn { 0% { opacity: 0; } 100% { opacity: 1; } }
+        @keyframes immerseKaraokeLineIn { 0% { opacity: 0; transform: translateY(10px); } 100% { opacity: 1; transform: translateY(0); } }
       `}</style>
 
-      {/* Blurred cover backdrop */}
-      {coverUrl ? (
-        <div aria-hidden style={{
-          position: 'absolute', inset: -80, backgroundImage: `url(${coverUrl})`,
-          backgroundSize: 'cover', backgroundPosition: 'center',
-          filter: 'blur(90px) saturate(1.5) brightness(0.5)', opacity: 0.85, pointerEvents: 'none',
-        }} />
-      ) : null}
-      <div aria-hidden style={{
-        position: 'absolute', inset: 0,
-        background: 'radial-gradient(ellipse at center, rgba(0,0,0,0.05) 0%, rgba(0,0,0,0.6) 100%)', pointerEvents: 'none',
-      }} />
+      {/* Backdrop — blurred album art (default) or the animated colour
+          field from the now-playing page. The field component ships its own
+          vignette; the radial one below belongs to cover mode only. */}
+      {backdropMode === 'field' ? (
+        <AnimatedGradientBg
+          accent={accent} mid={mid} wash={wash} coverUrl={coverUrl}
+          analyserRef={analyserRef} beatReactive={beatReactive} isPlaying={isPlaying}
+        />
+      ) : (
+        <>
+          {coverUrl ? (
+            <div aria-hidden ref={backdropRef} style={{
+              position: 'absolute', inset: -80, backgroundImage: `url(${coverUrl})`,
+              backgroundSize: 'cover', backgroundPosition: 'center',
+              filter: 'blur(90px) saturate(1.5) brightness(0.5)', opacity: 0.85, pointerEvents: 'none',
+              willChange: beatReactive ? 'filter, transform' : 'auto',
+            }} />
+          ) : null}
+          <div aria-hidden style={{
+            position: 'absolute', inset: 0,
+            background: 'radial-gradient(ellipse at center, rgba(0,0,0,0.05) 0%, rgba(0,0,0,0.6) 100%)', pointerEvents: 'none',
+          }} />
+        </>
+      )}
 
       {/* Draggable strip — a fixed-width band in the CENTER of the top edge.
           Fixed insets (not %) guarantee the close button in the top-left
@@ -271,24 +364,45 @@ function CoverFullscreenOverlay({
         position: 'absolute', top: 0, left: 160, right: 160, height: 52, WebkitAppRegion: 'drag', zIndex: 4,
       }} />
 
-      {/* Close — top-left, clear of OS window controls */}
-      <button type="button" onClick={(e) => { e.stopPropagation(); onClose?.(); }}
+      {/* Close — top-right circular glass button. Frameless window (no native
+          OS controls), so the corner is free. Stays clickable even after the
+          chrome idle-hides: opacity fades for clean viewing but pointer events
+          remain, and hovering (or any movement) wakes the controls. */}
+      <button type="button"
+        onClick={(e) => { e.stopPropagation(); onClose?.(); }}
+        onMouseEnter={(e) => {
+          bumpActivity();
+          e.currentTarget.style.background = `rgba(${accent}, 0.9)`;
+          e.currentTarget.style.borderColor = `rgba(${accent}, 0.95)`;
+          e.currentTarget.style.color = '#fff';
+          e.currentTarget.style.transform = 'scale(1.06)';
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.background = 'rgba(255,255,255,0.07)';
+          e.currentTarget.style.borderColor = 'rgba(255,255,255,0.16)';
+          e.currentTarget.style.color = 'rgba(255,255,255,0.82)';
+          e.currentTarget.style.transform = idle ? 'scale(0.9)' : 'scale(1)';
+        }}
         title="Close (Esc)" aria-label="Close fullscreen"
         style={{
-          position: 'absolute', top: 16, left: 16, zIndex: 5, WebkitAppRegion: 'no-drag',
-          display: 'inline-flex', alignItems: 'center', gap: 7, height: 36, padding: '0 14px 0 11px',
-          borderRadius: 999, background: 'rgba(0,0,0,0.5)', border: '1px solid rgba(255,255,255,0.14)',
-          color: 'rgba(255,255,255,0.85)', cursor: 'pointer', fontSize: 12, fontWeight: 600,
-          backdropFilter: 'blur(14px)', WebkitBackdropFilter: 'blur(14px)', transition: 'background 0.15s, color 0.15s, opacity 0.4s ease',
-          opacity: idle ? 0 : 1, pointerEvents: idle ? 'none' : 'auto',
+          position: 'absolute', top: 18, right: 18, zIndex: 5, WebkitAppRegion: 'no-drag',
+          width: 38, height: 38, borderRadius: 999, padding: 0,
+          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+          background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.16)',
+          color: 'rgba(255,255,255,0.82)', cursor: 'pointer',
+          backdropFilter: 'blur(18px) saturate(1.4)', WebkitBackdropFilter: 'blur(18px) saturate(1.4)',
+          boxShadow: '0 6px 22px rgba(0,0,0,0.4)',
+          // Idle fades the button out for distraction-free art, but it never
+          // stops accepting clicks — any pointer movement re-reveals it.
+          opacity: idle ? 0 : 1,
+          pointerEvents: 'auto',
+          transform: idle ? 'scale(0.9)' : 'scale(1)',
+          transition: 'opacity 0.4s ease, transform 0.3s cubic-bezier(0.16,1,0.3,1), background 0.18s ease, border-color 0.18s ease, color 0.18s ease',
         }}
-        onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(0,0,0,0.78)'; e.currentTarget.style.color = '#fff'; }}
-        onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(0,0,0,0.5)'; e.currentTarget.style.color = 'rgba(255,255,255,0.85)'; }}
       >
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M19 12H5" /><path d="M12 19l-7-7 7-7" />
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M18 6 6 18" /><path d="M6 6l12 12" />
         </svg>
-        Close
       </button>
 
       {/* Content: rail + (optional) lyrics centerpiece */}
@@ -297,31 +411,148 @@ function CoverFullscreenOverlay({
         style={{
           position: 'relative', zIndex: 2, cursor: 'default',
           display: 'flex', alignItems: 'stretch', justifyContent: 'center',
-          width: hasAnyLyrics ? '100%' : 'auto', height: hasAnyLyrics ? '100%' : 'auto',
+          width: 'auto', height: 'auto',
           maxWidth: '100vw',
+          gap: sideLyrics ? 'clamp(20px, 3.5vw, 56px)' : 0,
         }}
       >
         {rail}
-        {hasAnyLyrics ? (
+        {sideLyrics ? (
           <div style={{
-            flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center',
-            padding: '6vmin clamp(28px, 5vw, 80px)', minWidth: 0,
-            animation: reduceMotion ? 'none' : 'immerseFullscreenLyricsIn 360ms ease-out both', animationDelay: '80ms',
+            // Chrome-free lyrics column: same height as the cover, floating
+            // text only — no panel, no border, no frost.
+            width: 'min(36vw, 460px)', height: 'min(52vh, 42vw)',
+            alignSelf: 'center', minWidth: 0,
+            display: 'flex', flexDirection: 'column', justifyContent: 'center',
+            animation: reduceMotion ? 'none' : 'immerseFullscreenLyricsIn 360ms ease-out both',
+            animationDelay: '80ms',
           }}>
             {hasSyncedLyrics ? (
-              <SyncedLyrics
-                lines={lyricsData.synced}
-                currentTime={currentTime}
-                accent={accent}
-                onSeek={onSeek}
-                fontSize={21}
-                lineHeight={1.5}
-              />
+              <SyncedLyrics lines={lyricsData.synced} currentTime={currentTime} accent={accent} onSeek={onSeek} fontSize={20} lineHeight={1.5} />
             ) : (
-              <PlainLyrics text={lyricsData.plain} fontSize={22} lineHeight={1.7} accent={accent} />
+              <PlainLyrics text={lyricsData.plain} fontSize={19} lineHeight={1.7} accent={accent} />
             )}
           </div>
         ) : null}
+      </div>
+
+      {/* Floating control dock — compact frosted pill. A 1fr/auto/1fr grid
+          keeps the seek bar dead-center regardless of how wide the transport
+          and volume clusters are. Buttons are dock-scale (28px), not the
+          56px now-playing-page media buttons. */}
+      <div onClick={(e) => e.stopPropagation()} style={{
+        position: 'absolute', left: 0, right: 0, bottom: 22, zIndex: 4,
+        display: 'flex', justifyContent: 'center',
+        ...barFade,
+      }}>
+        <div style={{
+          display: 'grid', gridTemplateColumns: '1fr auto 1fr', alignItems: 'center', gap: 14,
+          width: 'min(690px, 94vw)',
+          padding: '8px 16px', borderRadius: 999,
+          background: 'rgba(18,18,20,0.62)',
+          backdropFilter: 'blur(30px) saturate(1.6)',
+          WebkitBackdropFilter: 'blur(30px) saturate(1.6)',
+          border: '1px solid rgba(255,255,255,0.1)',
+          boxShadow: '0 24px 60px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.07)',
+        }}>
+          {/* Transport — compact */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 5, justifySelf: 'start' }}>
+            <FsDockBtn onClick={onToggleShuffle} title="Shuffle" active={shuffleOn}>
+              <Shuffle size={15} strokeWidth={2} />
+            </FsDockBtn>
+            <FsDockBtn onClick={onPrev} title="Previous">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M17 4L7 12l10 8" />
+              </svg>
+            </FsDockBtn>
+            <FsDockBtn onClick={onTogglePlay} title={isPlaying ? 'Pause' : 'Play'} emphasized>
+              {isPlaying ? (
+                <svg width="21" height="21" viewBox="0 0 32 32" fill="currentColor" stroke="none">
+                  <rect x="10.5" y="7" width="4" height="18" rx="2" />
+                  <rect x="17.5" y="7" width="4" height="18" rx="2" />
+                </svg>
+              ) : (
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" stroke="none" style={{ marginLeft: 1 }}>
+                  <path d="M8 5.6c-1.4-1-3.5 0-3.5 1.7v9.4c0 1.75 2.1 2.75 3.5 1.7l8-5c1.4-.85 1.4-2.65 0-3.5l-8-4.3z" />
+                </svg>
+              )}
+            </FsDockBtn>
+            <FsDockBtn onClick={onNext} title="Next">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M7 4l10 8-10 8" />
+              </svg>
+            </FsDockBtn>
+            <FsDockBtn onClick={onToggleRepeat} title={`Repeat: ${repeat}`} active={repeat !== 'off'}>
+              {repeat === 'one' ? (
+                <Repeat1 size={15} strokeWidth={2} />
+              ) : (
+                <Repeat size={15} strokeWidth={2} />
+              )}
+            </FsDockBtn>
+          </div>
+
+          {/* Seek — dead-center */}
+          <div style={{ width: 'clamp(190px, 26vw, 260px)', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ color: 'rgba(255,255,255,0.6)', fontSize: 10, fontVariantNumeric: 'tabular-nums', minWidth: 30, textAlign: 'right', flexShrink: 0 }}>{formatTime(currentTime)}</span>
+            <HeartSlider value={currentTime} max={duration || 0} onChange={(v) => onSeek?.(v)} accent={accent} ariaLabel="Seek" thumbSize={11} thumbShape={nowPlayingSliderStyle} />
+            <span style={{ color: 'rgba(255,255,255,0.6)', fontSize: 10, fontVariantNumeric: 'tabular-nums', minWidth: 30, flexShrink: 0 }}>{formatTime(duration)}</span>
+          </div>
+
+          {/* Volume — right */}
+          {onSetVolume ? (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 5, justifySelf: 'end' }}>
+              <FsDockBtn onClick={() => onSetVolume?.(volume > 0 ? 0 : 1)} title={volume > 0 ? 'Mute (M)' : 'Unmute (M)'}>
+                {volume <= 0 ? (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M11 5L6 9H2v6h4l5 4V5z" /><line x1="23" y1="9" x2="17" y2="15" /><line x1="17" y1="9" x2="23" y2="15" />
+                  </svg>
+                ) : volume < 0.5 ? (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M11 5L6 9H2v6h4l5 4V5z" /><path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                  </svg>
+                ) : (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M11 5L6 9H2v6h4l5 4V5z" /><path d="M15.54 8.46a5 5 0 0 1 0 7.07" /><path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                  </svg>
+                )}
+              </FsDockBtn>
+              <div style={{ width: 72, display: 'flex' }}>
+                <HeartSlider value={volume} max={1} onChange={(v) => onSetVolume?.(v)} accent={accent} ariaLabel="Volume" thumbSize={10} thumbShape={nowPlayingSliderStyle} />
+              </div>
+              {hasAnyLyrics && onSetFullscreenLyricsMode ? (
+                <FsDockBtn
+                  onClick={() => onSetFullscreenLyricsMode(fullscreenLyricsMode === 'side' ? 'flip' : 'side')}
+                  title={fullscreenLyricsMode === 'side'
+                    ? 'Lyrics: beside cover — switch to flip mode'
+                    : 'Lyrics: flip cover (L) — switch to beside-cover mode'}
+                  active
+                >
+                  {fullscreenLyricsMode === 'side' ? (
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="3" y="6" width="9" height="12" rx="1.5" /><line x1="16" y1="8" x2="21" y2="8" /><line x1="16" y1="12" x2="21" y2="12" /><line x1="16" y1="16" x2="19" y2="16" />
+                    </svg>
+                  ) : (
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M8 3H5a2 2 0 0 0-2 2v3" /><path d="M16 3h3a2 2 0 0 1 2 2v3" /><rect x="7" y="8" width="10" height="10" rx="1.5" />
+                    </svg>
+                  )}
+                </FsDockBtn>
+              ) : null}
+              <FsDockBtn
+                onClick={() => setBackdrop(backdropMode === 'cover' ? 'field' : 'cover')}
+                title={backdropMode === 'cover'
+                  ? 'Background: album glow — switch to colour field'
+                  : 'Background: colour field — switch to album glow'}
+                active={backdropMode === 'field'}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M3 14c2-3 4-3 6 0s4 3 6 0 4-3 6 0" />
+                  <path d="M3 8c2-3 4-3 6 0s4 3 6 0 4-3 6 0" />
+                </svg>
+              </FsDockBtn>
+            </div>
+          ) : null}
+        </div>
       </div>
     </div>
   );

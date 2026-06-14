@@ -891,6 +891,8 @@ function SideDock({
   onSetPreviewVolumePosition,
   nowPlayingSliderStyle = 'circle',
   onSetNowPlayingSliderStyle,
+  fullscreenLyricsMode = 'side',
+  onSetFullscreenLyricsMode,
   onShowOnboarding,
   firstTimeSparkleEnabled = false,
   onSetFirstTimeSparkleEnabled,
@@ -1324,6 +1326,8 @@ function SideDock({
             onSetPreviewVolumePosition={onSetPreviewVolumePosition}
             nowPlayingSliderStyle={nowPlayingSliderStyle}
             onSetNowPlayingSliderStyle={onSetNowPlayingSliderStyle}
+            fullscreenLyricsMode={fullscreenLyricsMode}
+            onSetFullscreenLyricsMode={onSetFullscreenLyricsMode}
             randomButtonEnabled={randomButtonEnabled}
             onSetRandomButtonEnabled={onSetRandomButtonEnabled}
             breathingDockPillEnabled={breathingDockPillEnabled}
@@ -1579,7 +1583,7 @@ function CollapsedRail({
             color: 'rgba(255,255,255,0.6)', cursor: 'pointer',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             fontSize: 20, lineHeight: 1, fontWeight: 300,
-            transition: 'all 0.15s',
+            transition: 'background 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease, transform 0.15s cubic-bezier(0.16,1,0.3,1)',
           }}
           onMouseEnter={(e) => {
             e.currentTarget.style.borderColor = 'rgba(255,255,255,0.4)';

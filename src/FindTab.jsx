@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import Icons from './Icons.jsx';
 import { formatDurationMs } from './mediaUtils.js';
 import { Banner } from './SettingsTab.jsx';
+import { useToast } from './Toasts.jsx';
 
 function FindTab({
   importing,
@@ -16,6 +17,7 @@ function FindTab({
   isActive = true,
 }) {
   const api = typeof window !== 'undefined' ? window.electronAPI : null;
+  const pushToast = useToast();
   const [q, setQ] = useState('');
   const [mode, setMode] = useState('tracks');
   // Remembers the last Spotify sub-mode (tracks/albums/playlist) so
@@ -370,15 +372,25 @@ function FindTab({
       if (res?.ok && res.track) {
         onSpotifyImportDone?.(res.track);
         setOkLine(`Added "${res.track.title || row.filename}" to library.`);
+        pushToast({ message: `Added “${res.track.title || row.filename}” to library`, kind: 'success', dedupeKey: `slsk:${row.id}` });
+      } else if (res && res.ok === false) {
+        pushToast({
+          message: `Couldn’t download “${row.filename}”`, kind: 'error', dedupeKey: `slsk:${row.id}`,
+          action: { label: 'Retry', onClick: () => slskStartDownload(row) },
+        });
       }
     } catch (e) {
       setSlskDownloads((prev) => prev.map((d) =>
         d.rowId === row.id ? { ...d, state: 'failed', error: String(e?.message || e) } : d
       ));
+      pushToast({
+        message: `Download failed: “${row.filename}”`, kind: 'error', dedupeKey: `slsk:${row.id}`,
+        action: { label: 'Retry', onClick: () => slskStartDownload(row) },
+      });
     } finally {
       setImporting?.(false);
     }
-  }, [api, onSpotifyImportDone, setImporting]);
+  }, [api, onSpotifyImportDone, setImporting, pushToast]);
 
   // Per-album Soulseek download.
   const slskStartAlbumDownload = useCallback(async (alb) => {
@@ -412,15 +424,29 @@ function FindTab({
         setOkLine(res.partial
           ? `Saved ${res.tracks.length} of ${alb.tracks.length} tracks from "${alb.displayName}".`
           : `Saved album "${alb.displayName}" (${res.tracks.length} tracks).`);
+        pushToast({
+          message: res.partial
+            ? `Saved ${res.tracks.length} of ${alb.tracks.length} from “${alb.displayName}”`
+            : `Saved album “${alb.displayName}” (${res.tracks.length} tracks)`,
+          kind: res.partial ? 'warning' : 'success', dedupeKey: `slskalbum:${alb.id}`,
+        });
       } else if (res?.error) {
         setError(res.error);
+        pushToast({
+          message: `Album download failed: “${alb.displayName}”`, kind: 'error', dedupeKey: `slskalbum:${alb.id}`,
+          action: { label: 'Retry', onClick: () => slskStartAlbumDownload(alb) },
+        });
       }
     } catch (e) {
       setError(e?.message || String(e));
+      pushToast({
+        message: `Album download failed: “${alb.displayName}”`, kind: 'error', dedupeKey: `slskalbum:${alb.id}`,
+        action: { label: 'Retry', onClick: () => slskStartAlbumDownload(alb) },
+      });
     } finally {
       setImporting?.(false);
     }
-  }, [api, onSpotifyImportDone, setImporting]);
+  }, [api, onSpotifyImportDone, setImporting, pushToast]);
 
   /* ---------- Playlist import ---------- */
 
@@ -503,16 +529,27 @@ function FindTab({
           failures: res.failures || [],
         });
         setOkLine(`Imported ${res.completed} of ${tracks.length} tracks.`);
+        const failed = res.failed || 0;
+        pushToast({
+          message: failed > 0
+            ? `Imported ${res.completed} of ${tracks.length} · ${failed} not found`
+            : `Imported ${res.completed} track${res.completed === 1 ? '' : 's'}`,
+          kind: failed > 0 ? 'warning' : 'success',
+          dedupeKey: 'playlist-import',
+          durationMs: failed > 0 ? 8000 : 5000,
+        });
       } else {
         setError(res?.error || 'Playlist import failed.');
+        pushToast({ message: res?.error || 'Playlist import failed', kind: 'error', dedupeKey: 'playlist-import' });
       }
     } catch (e) {
       setError(e?.message || String(e));
+      pushToast({ message: `Playlist import failed: ${e?.message || e}`, kind: 'error', dedupeKey: 'playlist-import' });
     } finally {
       setImporting?.(false);
       setPlaylistImporting(false);
     }
-  }, [api, playlistData, playlistSkipIds, playlistSource, setImporting]);
+  }, [api, playlistData, playlistSkipIds, playlistSource, setImporting, pushToast]);
 
   const runSearch = useCallback(async () => {
     const query = q.trim();
@@ -558,11 +595,23 @@ function FindTab({
       // picker UI which calls selectPlaylist() directly. The Go button
       // is hidden in playlist mode (replaced by Refresh).
     } catch (e) {
-      setError(e?.message || String(e));
+      const msg = e?.message || String(e);
+      setError(msg);
+      // Surface connection/auth failures as an actionable toast. Spotify
+      // token/credential problems are the common cause; offer a jump to
+      // Settings to reconnect.
+      const isAuth = /token|auth|credential|401|403|unauthor/i.test(msg);
+      pushToast({
+        message: isAuth ? 'Spotify connection failed — check your credentials' : `Search failed: ${msg}`,
+        kind: 'error', dedupeKey: 'search-error',
+        action: isAuth && onOpenSettings
+          ? { label: 'Settings', onClick: () => onOpenSettings() }
+          : { label: 'Retry', onClick: () => runSearch() },
+      });
     } finally {
       setBusy(false);
     }
-  }, [q, api, mode, slskStatus.configured]);
+  }, [q, api, mode, slskStatus.configured, pushToast, onOpenSettings]);
 
   /**
    * Fetch and prep a specific Spotify playlist for import. Called from
@@ -668,6 +717,13 @@ function FindTab({
     setIsDownloading(false); setImporting(false); setSelected(new Set());
     setDownloadProgress({ current: 0, total: 0, title: '' });
     setOkLine(failed > 0 ? `Added ${completed} track${completed !== 1 ? 's' : ''}. ${failed} failed.` : `Added ${completed} track${completed !== 1 ? 's' : ''}.`);
+    pushToast({
+      message: failed > 0
+        ? `Added ${completed} track${completed !== 1 ? 's' : ''} · ${failed} failed`
+        : `Added ${completed} track${completed !== 1 ? 's' : ''} to library`,
+      kind: failed > 0 ? 'warning' : 'success',
+      dedupeKey: 'ytdlp-batch',
+    });
   };
 
   const cancelDownload = () => { downloadCancelledRef.current = true; };
@@ -727,6 +783,7 @@ function FindTab({
         onSpotifyImportDone?.(res.track);
         setDownloadedIds((prev) => new Set(prev).add(row.spotifyId));
         setOkLine(`Added "${row.title}".`);
+        pushToast({ message: `Added “${row.title}” to library`, kind: 'success', dedupeKey: `ytdlp:${row.spotifyId}` });
       } else if (res?.code === 'no-tier-match' && Array.isArray(res?.candidates) && res.candidates.length > 0) {
         // Auto-import found no qualifying candidate. Surface the picker so
         // the user can choose. We hand it the original meta + an onSuccess
@@ -738,12 +795,23 @@ function FindTab({
             onSpotifyImportDone?.(track);
             setDownloadedIds((prev) => new Set(prev).add(row.spotifyId));
             setOkLine(`Added "${row.title}".`);
+            pushToast({ message: `Added “${row.title}” to library`, kind: 'success', dedupeKey: `ytdlp:${row.spotifyId}` });
           },
         });
       } else {
         setError(res?.error || 'Import failed.');
+        pushToast({
+          message: `Couldn’t add “${row.title}”`, kind: 'error', dedupeKey: `ytdlp:${row.spotifyId}`,
+          action: { label: 'Retry', onClick: () => importSingle(row) },
+        });
       }
-    } catch (e) { setError(e?.message || String(e)); }
+    } catch (e) {
+      setError(e?.message || String(e));
+      pushToast({
+        message: `Import failed: “${row.title}”`, kind: 'error', dedupeKey: `ytdlp:${row.spotifyId}`,
+        action: { label: 'Retry', onClick: () => importSingle(row) },
+      });
+    }
     finally {
       setDownloadingIds((prev) => { const next = new Set(prev); next.delete(row.spotifyId); return next; });
     }
@@ -764,7 +832,7 @@ function FindTab({
               background: `rgba(${accent},0.12)`,
               color: '#fff', fontSize: 11, fontWeight: 700,
               cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6,
-              transition: 'all 0.15s cubic-bezier(0.16,1,0.3,1)',
+              transition: 'background 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease, transform 0.15s cubic-bezier(0.16,1,0.3,1)',
             }}>
             <span>{mode === 'tracks' ? 'Tracks' : mode === 'albums' ? 'Albums' : mode === 'playlist' ? 'Playlist' : 'Soulseek'}</span>
             <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" style={{ opacity: 0.6, transform: findMenuOpen ? 'rotate(180deg)' : 'rotate(0)', transition: 'transform 0.2s' }}>

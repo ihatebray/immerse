@@ -389,7 +389,7 @@ function LibraryTab({
                 background: `rgba(${accent},0.12)`,
                 color: '#fff', fontSize: 11, fontWeight: 700,
                 cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6,
-                transition: 'all 0.15s cubic-bezier(0.16,1,0.3,1)',
+                transition: 'background 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease, transform 0.15s cubic-bezier(0.16,1,0.3,1)',
               }}>
               <span>{view === 'songs' ? 'Songs' : view === 'favorites' ? 'Favorites' : view === 'albums' ? 'Albums' : 'Playlists'}</span>
               <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" style={{ opacity: 0.6, transform: viewMenuOpen ? 'rotate(180deg)' : 'rotate(0)', transition: 'transform 0.2s' }}>
@@ -710,7 +710,7 @@ function LibraryTab({
                             background: pinnedPlaylists.includes(pl.id) ? `rgba(${accent},0.2)` : 'transparent',
                             color: pinnedPlaylists.includes(pl.id) ? '#fff' : 'rgba(255,255,255,0.25)',
                             display: 'flex', alignItems: 'center', justifyContent: 'center',
-                            transition: 'all 0.15s',
+                            transition: 'background 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease, transform 0.15s cubic-bezier(0.16,1,0.3,1)',
                           }}
                           onMouseEnter={(e) => { e.currentTarget.style.color = '#fff'; e.currentTarget.style.background = `rgba(${accent},0.15)`; }}
                           onMouseLeave={(e) => { e.currentTarget.style.color = pinnedPlaylists.includes(pl.id) ? '#fff' : 'rgba(255,255,255,0.25)'; e.currentTarget.style.background = pinnedPlaylists.includes(pl.id) ? `rgba(${accent},0.2)` : 'transparent'; }}>

@@ -35,24 +35,51 @@ export function useToastBus() {
 
   const pushToast = useCallback((opts) => {
     if (!opts || !opts.message) return null;
-    counterRef.current += 1;
-    const id = `toast_${Date.now()}_${counterRef.current}`;
-    const toast = {
-      id,
-      message: String(opts.message),
-      kind: opts.kind || 'info',
-      action: opts.action || null,
-      durationMs: typeof opts.durationMs === 'number' ? opts.durationMs : DEFAULT_DURATION_MS,
-      createdAt: Date.now(),
-    };
+    const kind = opts.kind || 'info';
+    const message = String(opts.message);
+    // Collapse spam and let callers evolve one toast over time (e.g. a
+    // download going "Downloading…" → "Added"): an explicit dedupeKey groups
+    // updates; otherwise identical kind+message collapse onto each other.
+    const dedupeKey = opts.dedupeKey || `${kind}:${message}`;
+    const durationMs = typeof opts.durationMs === 'number' ? opts.durationMs : DEFAULT_DURATION_MS;
+    const action = opts.action || null;
+
+    let resultId = null;
     setToasts((prev) => {
+      const idx = prev.findIndex((t) => t.dedupeKey === dedupeKey);
+      if (idx !== -1) {
+        // Update the existing toast in place and reset its auto-dismiss timer
+        // (revision bump is wired into ToastRow's timer effect).
+        const existing = prev[idx];
+        resultId = existing.id;
+        const updated = {
+          ...existing,
+          message, kind, action, durationMs,
+          revision: (existing.revision || 0) + 1,
+          createdAt: Date.now(),
+        };
+        const next = prev.slice();
+        // Move the refreshed toast to the end so it reads as "most recent".
+        next.splice(idx, 1);
+        next.push(updated);
+        return next;
+      }
+      counterRef.current += 1;
+      resultId = `toast_${Date.now()}_${counterRef.current}`;
+      const toast = {
+        id: resultId,
+        dedupeKey,
+        message, kind, action, durationMs,
+        revision: 0,
+        createdAt: Date.now(),
+      };
       const next = [...prev, toast];
       if (next.length > MAX_VISIBLE_TOASTS) {
         return next.slice(next.length - MAX_VISIBLE_TOASTS);
       }
       return next;
     });
-    return id;
+    return resultId;
   }, []);
 
   const dismissToast = useCallback((id) => {
@@ -114,7 +141,7 @@ function ToastRow({ toast, onDismiss, accent }) {
     if (toast.durationMs <= 0) return undefined;
     const id = setTimeout(() => handleDismiss(), toast.durationMs);
     return () => clearTimeout(id);
-  }, [toast.id, toast.durationMs, handleDismiss]);
+  }, [toast.id, toast.durationMs, toast.revision, handleDismiss]);
 
   useEffect(() => {
     return () => {

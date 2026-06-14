@@ -157,12 +157,12 @@ function LyricsEditor({ track, currentTime, existingSynced, existingPlain, accen
     background: active ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.04)',
     color: active ? '#fff' : 'rgba(255,255,255,0.5)',
     fontSize: 10.5, fontWeight: 600, cursor: 'pointer',
-    transition: 'all 0.15s',
+    transition: 'background 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease, transform 0.15s cubic-bezier(0.16,1,0.3,1)',
   });
 
   const btnBase = {
     padding: '7px 14px', borderRadius: 10, border: 'none', fontSize: 11, fontWeight: 600,
-    cursor: 'pointer', transition: 'all 0.15s',
+    cursor: 'pointer', transition: 'background 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease, transform 0.15s cubic-bezier(0.16,1,0.3,1)',
   };
 
   if (step === 'edit') {
@@ -276,7 +276,7 @@ function LyricsEditor({ track, currentTime, existingSynced, existingPlain, accen
                 padding: '6px 8px', borderRadius: 8,
                 background: isCurrent ? `rgba(${accent},0.12)` : 'transparent',
                 borderLeft: isCurrent ? `2px solid rgba(${accent},0.7)` : '2px solid transparent',
-                transition: 'all 0.2s ease',
+                transition: 'background 0.2s ease, border-color 0.2s ease, color 0.2s ease, box-shadow 0.2s ease, transform 0.2s cubic-bezier(0.16,1,0.3,1)',
                 // Every line is clickable now — both stamped (seek+resume)
                 // and unstamped (just resume). The cursor reflects that.
                 cursor: 'pointer',

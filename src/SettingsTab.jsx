@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useLayoutEffect, useMemo, useContex
 import Icons from './Icons.jsx';
 import { presetsGrouped, presetById, getCustomFonts, setCustomFonts, loadGoogleFontForPreset } from './uiFonts.js';
 import { Tooltip, HeartSlider, ExplicitBadge } from './sharedUI.jsx';
+import { useToast } from './Toasts.jsx';
 
 function FontPicker({ selectedId, onSelect, refreshKey }) {
   const groups = useMemo(() => presetsGrouped(), [refreshKey]);
@@ -348,7 +349,7 @@ function CustomFontsManager({ onChange, version }) {
             width: '100%', padding: '7px 10px', borderRadius: 9,
             border: '1px dashed rgba(255,255,255,0.15)', background: 'transparent',
             color: 'rgba(255,255,255,0.7)', fontSize: 11.5, fontWeight: 600, cursor: 'pointer',
-            transition: 'all 0.15s',
+            transition: 'background 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease, transform 0.15s cubic-bezier(0.16,1,0.3,1)',
           }}
           onMouseEnter={(e) => {
             e.currentTarget.style.background = 'rgba(255,255,255,0.04)';
@@ -440,6 +441,8 @@ function SettingsTab({
   previewVolumePosition = 'bottomRight',
   onSetPreviewVolumePosition,
   nowPlayingSliderStyle = 'circle',
+  fullscreenLyricsMode = 'side',
+  onSetFullscreenLyricsMode,
   onSetNowPlayingSliderStyle,
   randomButtonEnabled = false,
   onSetRandomButtonEnabled,
@@ -661,6 +664,20 @@ function SettingsTab({
     if (typeof window !== 'undefined') {
       if (v) localStorage.setItem('immerse:allowMusicVideo', '1');
       else localStorage.removeItem('immerse:allowMusicVideo');
+    }
+  };
+
+  // Opt-in toast announcing each new track. Read live by App's track-change
+  // effect, so flipping this takes effect immediately. Stored as '1' or absent.
+  const [nowPlayingToast, setNowPlayingToast] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return localStorage.getItem('immerse:nowPlayingToast') === '1';
+  });
+  const updateNowPlayingToast = (v) => {
+    setNowPlayingToast(v);
+    if (typeof window !== 'undefined') {
+      if (v) localStorage.setItem('immerse:nowPlayingToast', '1');
+      else localStorage.removeItem('immerse:nowPlayingToast');
     }
   };
 
@@ -995,6 +1012,19 @@ function SettingsTab({
           onChange={(v) => onSetEdgeBleedEnabled?.(v)}
         />
         <SegmentedSettingRow
+          label="Fullscreen Lyrics"
+          options={[
+            { value: 'side', label: 'Beside cover' },
+            { value: 'flip', label: 'Flip cover' },
+          ]}
+          value={fullscreenLyricsMode}
+          onChange={(v) => onSetFullscreenLyricsMode?.(v)}
+          descriptions={{
+            side: 'In fullscreen (F), lyrics float beside the cover at its height, scrolling with the song.',
+            flip: 'In fullscreen (F), the art stays untouched — press L or click the cover to flip it over to a lyrics card.',
+          }}
+        />
+        <SegmentedSettingRow
           label="Slider Thumb Style"
           options={[
             { value: 'circle', label: 'Circle' },
@@ -1106,6 +1136,12 @@ function SettingsTab({
           description="The welcome screen picks one track for right now — based on the time, the day, and what you’ve been playing. Refreshes every few hours."
           checked={trackOfMomentEnabled}
           onChange={(v) => onSetTrackOfMomentEnabled?.(v)}
+        />
+        <ToggleRow
+          label="Now-Playing Toast"
+          description="Pops a small notification with the track name and artist each time a new song starts playing."
+          checked={nowPlayingToast}
+          onChange={updateNowPlayingToast}
         />
       </Section>
 
@@ -1472,6 +1508,8 @@ function SettingsTab({
           externally. */}
       <Section title="Library Maintenance" category="library">
         <RescanMetadataButton onReloadLibrary={onReloadLibrary} />
+        <div style={{ height: 18 }} />
+        <RepairCoversButton onReloadLibrary={onReloadLibrary} />
       </Section>
 
       {/* Danger zone — only exposed if the IPC is available (Electron) */}
@@ -2105,6 +2143,136 @@ function RescanMetadataButton({ onReloadLibrary }) {
   );
 }
 
+/**
+ * RepairCoversButton — sends library:repairCovers, which walks every track
+ * and trims the baked-in black bars off letterboxed cover art (the YouTube
+ * thumbnails yt-dlp embeds when Spotify had no album art), squaring them so
+ * they fill the now-playing / fullscreen frames with no black edges. Clean
+ * square covers are left alone. Mirrors the rescan button's progress UX.
+ */
+function RepairCoversButton({ onReloadLibrary }) {
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState(null); // { scanned, total, fixed, failed }
+  const [result, setResult] = useState(null);
+
+  const api = typeof window !== 'undefined' ? window.electronAPI : null;
+  const available = !!(api && typeof api.repairCovers === 'function');
+
+  const handleClick = async () => {
+    if (!available || busy) return;
+    setBusy(true);
+    setResult(null);
+    setProgress({ scanned: 0, total: 0, fixed: 0, failed: 0 });
+
+    let unsub = null;
+    if (typeof api.onRepairCoversProgress === 'function') {
+      unsub = api.onRepairCoversProgress((p) => { if (p) setProgress(p); });
+    }
+
+    let r;
+    try { r = await api.repairCovers(); }
+    catch (e) { r = { ok: false, error: String(e?.message || e) }; }
+
+    if (typeof unsub === 'function') unsub();
+
+    setBusy(false);
+    setResult(r);
+
+    if (r?.ok && r.fixed > 0 && typeof onReloadLibrary === 'function') {
+      try { await onReloadLibrary(); } catch { /* ignore */ }
+    }
+  };
+
+  if (!available) {
+    return (
+      <div style={{ fontSize: 10.5, color: 'rgba(255,255,255,0.4)', fontStyle: 'italic' }}>
+        Cover repair only works in the desktop app.
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div style={{
+        fontSize: 10.5, color: 'rgba(255,255,255,0.55)',
+        lineHeight: 1.55, marginBottom: 10,
+      }}>
+        Fix cover art that shows black edges in the now-playing and fullscreen
+        views. Trims the letterbox bars baked into thumbnail artwork and squares
+        it up. Covers that already look right are left untouched.
+      </div>
+      <button
+        type="button"
+        onClick={handleClick}
+        disabled={busy}
+        style={{
+          width: '100%', padding: '9px 12px', borderRadius: 9,
+          border: '1px solid rgba(255,255,255,0.10)',
+          background: busy ? 'rgba(255,255,255,0.04)' : 'rgba(255,255,255,0.06)',
+          color: 'rgba(255,255,255,0.85)',
+          fontSize: 11.5, fontWeight: 600,
+          cursor: busy ? 'default' : 'pointer',
+          transition: 'background 0.15s',
+        }}
+        onMouseEnter={(e) => { if (!busy) e.currentTarget.style.background = 'rgba(255,255,255,0.10)'; }}
+        onMouseLeave={(e) => { if (!busy) e.currentTarget.style.background = 'rgba(255,255,255,0.06)'; }}
+      >
+        {busy ? 'Repairing covers…' : 'Repair cover art'}
+      </button>
+
+      {busy && progress ? (
+        <div style={{ marginTop: 10 }}>
+          <div style={{
+            height: 4, borderRadius: 2,
+            background: 'rgba(255,255,255,0.06)', overflow: 'hidden',
+          }}>
+            <div style={{
+              height: '100%',
+              width: progress.total > 0
+                ? `${Math.min(100, (progress.scanned / progress.total) * 100)}%`
+                : '0%',
+              background: 'rgba(255,255,255,0.4)',
+              transition: 'width 0.2s',
+            }} />
+          </div>
+          <div style={{
+            marginTop: 6, fontSize: 10,
+            color: 'rgba(255,255,255,0.45)',
+            display: 'flex', justifyContent: 'space-between', gap: 8,
+            fontVariantNumeric: 'tabular-nums',
+          }}>
+            <span>{progress.scanned} / {progress.total}</span>
+            <span>{progress.fixed} fixed{progress.failed > 0 ? ` · ${progress.failed} failed` : ''}</span>
+          </div>
+        </div>
+      ) : null}
+
+      {!busy && result ? (
+        <div style={{
+          marginTop: 10, padding: '8px 10px', borderRadius: 7,
+          background: result.ok ? 'rgba(80,180,120,0.08)' : 'rgba(243,114,114,0.08)',
+          border: `1px solid ${result.ok ? 'rgba(80,180,120,0.2)' : 'rgba(243,114,114,0.25)'}`,
+          fontSize: 11, color: 'rgba(255,255,255,0.85)', lineHeight: 1.5,
+        }}>
+          {result.ok ? (
+            result.fixed > 0 ? (
+              <>
+                Fixed <strong>{result.fixed}</strong> cover{result.fixed === 1 ? '' : 's'}
+                {result.failed > 0 ? <> · <span style={{ color: 'rgba(243,114,114,0.85)' }}>{result.failed} failed</span></> : null}
+                .
+              </>
+            ) : (
+              <>No covers needed fixing — everything looks square.</>
+            )
+          ) : (
+            <>Cover repair failed: {result.error || 'unknown error'}</>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function ClearLibraryModal({ onConfirm, onClose }) {
   const [deleteFiles, setDeleteFiles] = useState(false);
   const [confirmText, setConfirmText] = useState('');
@@ -2670,28 +2838,67 @@ function ImgbbApiKeyField({ value, onChange }) {
  */
 function StreamOverlaySection({ accent = '120, 90, 220' }) {
   const api = typeof window !== 'undefined' ? window.electronAPI : null;
-  const [enabled, setEnabled] = useState(false);
+  const pushToast = useToast();
+  const [enabled, setEnabled] = useState(() => {
+    try { return typeof window !== 'undefined' && window.localStorage.getItem('immerse:streamOverlay') === '1'; } catch { return false; }
+  });
   const [url, setUrl] = useState('');
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
+  const [theme, setThemeState] = useState(() => {
+    try {
+      const t = typeof window !== 'undefined' ? window.localStorage.getItem('immerse:overlayTheme') : null;
+      return ['glass', 'led', 'island'].includes(t) ? t : 'glass';
+    } catch { return 'glass'; }
+  });
 
-  // Reflect current server status on mount.
+  // Push the saved theme to the overlay once on mount so the running widget
+  // reflects the user's choice even after a restart.
   useEffect(() => {
-    if (!api?.twitchOverlayStatus) return;
-    api.twitchOverlayStatus().then((r) => {
-      if (r?.running) { setEnabled(true); setUrl(r.url || ''); }
+    if (api?.twitchSetOptions) api.twitchSetOptions({ theme }).catch(() => {});
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const setTheme = (t) => {
+    setThemeState(t);
+    try { window.localStorage.setItem('immerse:overlayTheme', t); } catch { /* ignore */ }
+    if (api?.twitchSetOptions) api.twitchSetOptions({ theme: t }).catch(() => {});
+  };
+
+  const persist = (v) => {
+    try {
+      if (v) window.localStorage.setItem('immerse:streamOverlay', '1');
+      else window.localStorage.removeItem('immerse:streamOverlay');
+    } catch { /* ignore */ }
+  };
+
+  // On mount: reflect a running server, and if the overlay was left enabled
+  // last session, make sure it's started again (so it survives a restart).
+  useEffect(() => {
+    if (!api?.twitchOverlayStatus) return undefined;
+    let cancelled = false;
+    api.twitchOverlayStatus().then(async (r) => {
+      if (cancelled) return;
+      if (r?.running) { setEnabled(true); setUrl(r.url || ''); return; }
+      if (enabled && api.twitchOverlayStart) {
+        const s = await api.twitchOverlayStart().catch(() => null);
+        if (cancelled) return;
+        if (s?.ok) setUrl(s.url || '');
+        else if (s) { setError(s.error || ''); }
+      }
     }).catch(() => {});
-  }, []);
+    return () => { cancelled = true; };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggle = async (v) => {
     setError('');
     setEnabled(v);
+    persist(v);
     if (!api) { setError('Overlay needs the desktop app.'); return; }
     try {
       if (v) {
         const r = await api.twitchOverlayStart?.();
         if (r?.ok) setUrl(r.url || '');
-        else { setError(r?.error || 'Could not start the overlay server.'); setEnabled(false); }
+        else { setError(r?.error || 'Could not start the overlay server.'); setEnabled(false); persist(false); }
       } else {
         await api.twitchOverlayStop?.();
         setUrl('');
@@ -2701,7 +2908,11 @@ function StreamOverlaySection({ accent = '120, 90, 220' }) {
 
   const copy = async () => {
     if (!url) return;
-    try { await navigator.clipboard.writeText(url); setCopied(true); setTimeout(() => setCopied(false), 1400); } catch { /* ignore */ }
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true); setTimeout(() => setCopied(false), 1400);
+      pushToast({ message: 'Overlay URL copied — paste into an OBS Browser Source', kind: 'success', dedupeKey: 'overlay-url-copy' });
+    } catch { pushToast({ message: 'Couldn’t copy the URL', kind: 'error', dedupeKey: 'overlay-url-copy' }); }
   };
 
   return (
@@ -2717,6 +2928,33 @@ function StreamOverlaySection({ accent = '120, 90, 220' }) {
           {error ? (
             <div style={{ fontSize: 10.5, color: '#f37272', marginBottom: 8 }}>{error}</div>
           ) : null}
+
+          {/* Theme picker — Glass / LED / Island */}
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'rgba(255,255,255,0.4)', marginBottom: 6 }}>Style</div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              {[
+                { id: 'glass', label: 'Glass' },
+                { id: 'led', label: 'LED Marquee' },
+                { id: 'island', label: 'Dynamic Island' },
+              ].map((opt) => {
+                const active = theme === opt.id;
+                return (
+                  <button key={opt.id} type="button" onClick={() => setTheme(opt.id)}
+                    style={{
+                      flex: 1, padding: '8px 6px', borderRadius: 8, cursor: 'pointer',
+                      border: `1px solid ${active ? `rgba(${accent},0.7)` : 'rgba(255,255,255,0.12)'}`,
+                      background: active ? `rgba(${accent},0.18)` : 'rgba(255,255,255,0.04)',
+                      color: active ? '#fff' : 'rgba(255,255,255,0.65)',
+                      fontSize: 11, fontWeight: 600, transition: 'background 0.15s ease, border-color 0.15s ease, color 0.15s ease',
+                    }}>
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
           {url ? (
             <>
               <div style={{ display: 'flex', gap: 6, alignItems: 'stretch' }}>
@@ -2797,10 +3035,11 @@ function ToggleRow({ label, description, checked, onChange }) {
       >
         <div
           style={{
-            position: 'absolute', top: 1, left: checked ? 15 : 1,
+            position: 'absolute', top: 1, left: 1,
             width: 16, height: 16, borderRadius: '50%',
             background: '#fff',
-            transition: 'left 0.22s cubic-bezier(0.4, 0, 0.2, 1)',
+            transform: checked ? 'translateX(14px)' : 'translateX(0)',
+            transition: 'transform 0.22s cubic-bezier(0.4, 0, 0.2, 1)',
             boxShadow: '0 1px 2px rgba(0,0,0,0.3)',
           }}
         />

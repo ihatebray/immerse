@@ -563,6 +563,18 @@ export default function App() {
     } catch { /* ignore */ }
   }, [nowPlayingSliderStyle]);
 
+  // Fullscreen lyrics presentation: 'side' (column beside the cover) or
+  // 'flip' (press L to flip the artwork over to a lyric card).
+  const [fullscreenLyricsMode, setFullscreenLyricsMode] = useState(() => {
+    try {
+      const v = window.localStorage.getItem('immerse:fullscreenLyricsMode');
+      return v === 'flip' ? 'flip' : 'side';
+    } catch { return 'side'; }
+  });
+  useEffect(() => {
+    try { window.localStorage.setItem('immerse:fullscreenLyricsMode', fullscreenLyricsMode); } catch { /* ignore */ }
+  }, [fullscreenLyricsMode]);
+
   /* ---------- Experimental (Dev) toggles ----------------------------------
    *
    * Each of these gates a feature that's still being shaped. They live behind
@@ -1088,6 +1100,62 @@ export default function App() {
       showWhenPaused: streamOverlayShowPaused,
     }).catch(() => { /* ignore */ });
   }, [streamOverlayEnabled, streamOverlayTheme, streamOverlayShowPaused]);
+
+  // Opt-in "now playing" toast on track change. Off by default; toggled in
+  // Settings via the immerse:nowPlayingToast flag (read live so the toggle
+  // takes effect without a reload). Uses a single deduped slot so rapid
+  // skips refresh one toast instead of stacking.
+  const lastNowPlayingToastId = useRef(null);
+  useEffect(() => {
+    let enabled = false;
+    try { enabled = typeof window !== 'undefined' && window.localStorage.getItem('immerse:nowPlayingToast') === '1'; } catch { /* ignore */ }
+    if (!enabled || !isPlaying) return;
+    const track = queue[currentIndex];
+    if (!track || track.id === lastNowPlayingToastId.current) return;
+    lastNowPlayingToastId.current = track.id;
+    const who = track.artist ? ` — ${track.artist}` : '';
+    pushToast({
+      message: `▶  ${track.title || 'Unknown track'}${who}`,
+      kind: 'info',
+      dedupeKey: 'now-playing',
+      durationMs: 4000,
+    });
+  }, [queue[currentIndex]?.id, isPlaying, pushToast]);
+
+  // Push now-playing state to the OBS overlay on every track / play-state
+  // change. Intentionally UNCONDITIONAL (and independent of Discord): the
+  // main-process setNowPlaying is just a cheap state write when the overlay
+  // server isn't running, and the overlay's own toggle (in Settings) owns the
+  // server lifecycle. Previously the only push lived inside the Discord effect,
+  // gated behind discordPresenceEnabled, so the overlay stayed blank unless
+  // Discord was also configured. Unlike Discord (public http(s) URLs only), an
+  // OBS browser source renders data: URLs directly, so local tracks with only
+  // embedded art still show their cover here.
+  useEffect(() => {
+    const api = typeof window !== 'undefined' ? window.electronAPI : null;
+    if (!api?.twitchSetNowPlaying) return;
+    const track = queue[currentIndex];
+    if (!track) { api.twitchSetNowPlaying(null).catch(() => { /* ignore */ }); return; }
+    // Send whatever cover the app stores (usually a studio-cover:// URL, sometimes
+    // data: or a remote http URL). The overlay server's /cover endpoint resolves
+    // any of these to real bytes OBS can load.
+    const overlayCover = track.coverArt || track.coverArtUrl || track.albumArtUrl || '';
+    api.twitchSetNowPlaying({
+      title: track.title || 'Unknown track',
+      artist: track.artist || '',
+      album: track.album || '',
+      coverArtUrl: overlayCover,
+      isPlaying,
+      // NOTE: theme + accent are intentionally omitted here. They're owned by
+      // Settings (theme) and the now-playing page (cover accent) via
+      // twitchSetOptions; the overlay preserves them across track updates, so
+      // re-sending them here would clobber the user's choice / the cover tint.
+    }).catch(() => { /* ignore */ });
+  }, [
+    queue[currentIndex]?.id,
+    queue[currentIndex]?.coverArt,
+    isPlaying,
+  ]);
 
   /** Panel resize — when enabled, the inner edge of the side panel becomes
    * a drag handle for resizing the panel's width. Persisted. Off by default. */
@@ -2321,9 +2389,6 @@ export default function App() {
       startedAtMs: discordWallStartRef.current,
     };
     api.discordSetActivity(payload).catch(() => { /* ignore */ });
-    // Mirror to the Twitch now-playing overlay (OBS browser source). Safe to
-    // call unconditionally — it's a no-op when the overlay server isn't running.
-    if (api.twitchSetNowPlaying) api.twitchSetNowPlaying(payload).catch(() => { /* ignore */ });
 
     const effectiveImgbbApiKey = (imgbbApiKey || '').trim();
 
@@ -2446,6 +2511,9 @@ export default function App() {
     const ids = new Set((trackIds || []).map(String).filter(Boolean));
     if (ids.size === 0) return;
     const api = window.electronAPI;
+    // Snapshot the full track objects before removal so an Undo can re-add
+    // them. Pull from the live library (the source of truth for metadata).
+    const removedTracks = libraryRef.current.filter((t) => ids.has(t.id));
     let removedOk = false;
     if (api && typeof api.removeLibraryTracks === 'function') {
       const r = await api.removeLibraryTracks([...ids]);
@@ -2486,6 +2554,30 @@ export default function App() {
       const ni = nextQ.findIndex((t) => t.id === curId);
       setCurrentIndex(ni >= 0 ? ni : Math.min(curIdx, Math.max(0, nextQ.length - 1)));
     }
+
+    // Undo toast — re-add the snapshotted tracks to the DB and reload. Only
+    // offered when we actually captured the rows and the add API exists.
+    const canUndo = removedTracks.length > 0 && typeof api?.addLibraryTracks === 'function';
+    const label = removedTracks.length === 1
+      ? `Removed “${removedTracks[0].title || 'track'}” from library`
+      : `Removed ${ids.size} tracks from library`;
+    pushToast({
+      message: label,
+      kind: 'info',
+      durationMs: 7000,
+      action: canUndo ? {
+        label: 'Undo',
+        onClick: async () => {
+          try {
+            await api.addLibraryTracks(removedTracks);
+            await reloadLibrary();
+            pushToast({ message: removedTracks.length === 1 ? 'Track restored' : `${removedTracks.length} tracks restored`, kind: 'success' });
+          } catch (e) {
+            pushToast({ message: `Couldn’t undo: ${e?.message || e}`, kind: 'error' });
+          }
+        },
+      } : null,
+    });
   };
 
   /** Update metadata fields on a single track and refresh the library. */
@@ -2949,8 +3041,40 @@ export default function App() {
   const deletePlaylist = async (id) => {
     const api = window.electronAPI;
     if (!api?.deletePlaylist) return { ok: false, error: 'Not supported' };
+    // Snapshot for undo: the playlist's fields + its ordered track ids.
+    const snapshot = (playlists || []).find((p) => p.id === id) || null;
+    let trackIds = [];
+    if (api.loadPlaylistTrackIds) {
+      try {
+        const r = await api.loadPlaylistTrackIds(id);
+        trackIds = Array.isArray(r) ? r : (r?.trackIds || []);
+      } catch { /* ignore */ }
+    }
     const r = await api.deletePlaylist(id);
-    if (r?.ok) await refreshPlaylists();
+    if (r?.ok) {
+      await refreshPlaylists();
+      const canUndo = !!snapshot && typeof api.createPlaylist === 'function';
+      pushToast({
+        message: `Deleted playlist “${snapshot?.name || 'Untitled'}”`,
+        kind: 'info', durationMs: 7000,
+        action: canUndo ? {
+          label: 'Undo',
+          onClick: async () => {
+            try {
+              const created = await api.createPlaylist({ name: snapshot.name, coverArt: snapshot.coverArt });
+              const newId = created?.id || created?.playlist?.id;
+              if (newId && trackIds.length && api.addTracksToPlaylist) {
+                await api.addTracksToPlaylist(newId, trackIds);
+              }
+              await refreshPlaylists();
+              pushToast({ message: `Restored “${snapshot.name || 'playlist'}”`, kind: 'success' });
+            } catch (e) {
+              pushToast({ message: `Couldn’t undo: ${e?.message || e}`, kind: 'error' });
+            }
+          },
+        } : null,
+      });
+    }
     return r;
   };
 
@@ -3140,6 +3264,8 @@ export default function App() {
         onSetPreviewVolumePosition={setPreviewVolumePosition}
         nowPlayingSliderStyle={nowPlayingSliderStyle}
         onSetNowPlayingSliderStyle={setNowPlayingSliderStyle}
+        fullscreenLyricsMode={fullscreenLyricsMode}
+        onSetFullscreenLyricsMode={setFullscreenLyricsMode}
         playEvents={playEvents}
         onResetStats={resetAllStats}
         statsRangeTabsEnabled={statsRangeTabsEnabled}

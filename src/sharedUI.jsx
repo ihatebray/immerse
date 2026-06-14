@@ -222,7 +222,10 @@ function HeartSlider({ value = 0, max = 0, onChange, accent = '255, 255, 255', a
         position: 'absolute', left: 0, width: `${pct}%`, height: 2, top: '50%', marginTop: -1,
         background: thumbVisible ? `rgba(${accent}, 1)` : 'rgba(255,255,255,0.95)',
         borderRadius: 2, maxWidth: '100%',
-        transition: 'background 0.18s, height 0.15s',
+        // Smoothly interpolate the fill between the (coarse) time updates so
+        // the playhead glides instead of stepping. Disabled while dragging so
+        // a manual seek tracks the pointer with zero lag.
+        transition: dragging ? 'background 0.18s' : 'width 0.18s linear, background 0.18s',
         // Slight glow when grabbing so the bar feels alive
         boxShadow: dragging ? `0 0 8px rgba(${accent}, 0.45)` : 'none',
       }} />
@@ -235,7 +238,9 @@ function HeartSlider({ value = 0, max = 0, onChange, accent = '255, 255, 255', a
         top: '50%',
         transform: `translate(-50%, -50%) scale(${thumbScale})`,
         opacity: thumbVisible ? 1 : 0,
-        transition: 'opacity 0.18s ease, transform 0.18s cubic-bezier(0.34, 1.56, 0.64, 1)',
+        transition: dragging
+          ? 'opacity 0.18s ease, transform 0.18s cubic-bezier(0.34, 1.56, 0.64, 1)'
+          : 'opacity 0.18s ease, transform 0.18s cubic-bezier(0.34, 1.56, 0.64, 1), left 0.18s linear',
         pointerEvents: 'none',
         // Tiny drop-shadow so the heart reads against any cover-art color
         filter: dragging

@@ -526,7 +526,7 @@ function PlaylistEditor({ mode, playlist, pendingAddCount = 0, onSave, onClose, 
                   background: coverMode === 'url' ? `rgba(${accent},0.2)` : 'rgba(255,255,255,0.03)',
                   color: coverMode === 'url' ? '#fff' : 'rgba(255,255,255,0.6)',
                   fontSize: 9, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', cursor: 'pointer',
-                  transition: 'all 0.15s',
+                  transition: 'background 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease, transform 0.15s cubic-bezier(0.16,1,0.3,1)',
                 }}>
                 URL
               </button>
@@ -539,7 +539,7 @@ function PlaylistEditor({ mode, playlist, pendingAddCount = 0, onSave, onClose, 
                     background: 'rgba(255,255,255,0.03)',
                     color: 'rgba(255,255,255,0.55)',
                     fontSize: 9, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', cursor: 'pointer',
-                    transition: 'all 0.15s',
+                    transition: 'background 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease, transform 0.15s cubic-bezier(0.16,1,0.3,1)',
                   }}
                   onMouseEnter={(e) => { e.currentTarget.style.color = '#f37272'; e.currentTarget.style.borderColor = 'rgba(243,114,114,0.4)'; e.currentTarget.style.background = 'rgba(243,114,114,0.1)'; }}
                   onMouseLeave={(e) => { e.currentTarget.style.color = 'rgba(255,255,255,0.55)'; e.currentTarget.style.borderColor = 'rgba(255,255,255,0.12)'; e.currentTarget.style.background = 'rgba(255,255,255,0.03)'; }}>
@@ -627,7 +627,7 @@ function PlaylistEditor({ mode, playlist, pendingAddCount = 0, onSave, onClose, 
               border: '1px solid rgba(255,255,255,0.1)',
               background: 'transparent', color: 'rgba(255,255,255,0.75)',
               fontSize: 11.5, fontWeight: 600, cursor: 'pointer',
-              transition: 'all 0.15s',
+              transition: 'background 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease, transform 0.15s cubic-bezier(0.16,1,0.3,1)',
             }}
             onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.04)'; e.currentTarget.style.color = '#fff'; }}
             onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'rgba(255,255,255,0.75)'; }}>
@@ -640,7 +640,7 @@ function PlaylistEditor({ mode, playlist, pendingAddCount = 0, onSave, onClose, 
               color: !hasChanges || saving ? 'rgba(255,255,255,0.35)' : '#fff',
               fontSize: 11.5, fontWeight: 700,
               cursor: !hasChanges || saving ? 'default' : 'pointer',
-              transition: 'all 0.15s',
+              transition: 'background 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease, transform 0.15s cubic-bezier(0.16,1,0.3,1)',
               boxShadow: !hasChanges || saving ? 'none' : `0 2px 12px rgba(${accent},0.2)`,
             }}>
             {submitText}

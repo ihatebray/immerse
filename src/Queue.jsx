@@ -172,7 +172,7 @@ function QueueHandle({ count, onOpen, accent }) {
         cursor: 'pointer',
         display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
         padding: 0,
-        transition: 'all 200ms cubic-bezier(0.4, 0, 0.2, 1)',
+        transition: 'background 200ms ease, border-color 200ms ease, color 200ms ease, box-shadow 200ms ease, transform 200ms cubic-bezier(0.4, 0, 0.2, 1)',
         boxShadow: hovered ? '0 -4px 16px rgba(0, 0, 0, 0.4)' : '0 -2px 8px rgba(0, 0, 0, 0.25)',
       }}
     >

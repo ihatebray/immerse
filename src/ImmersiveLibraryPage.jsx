@@ -71,6 +71,8 @@ export default function ImmersiveLibraryPage({
   onSetPreviewVolumePosition,
   nowPlayingSliderStyle = 'circle',
   onSetNowPlayingSliderStyle,
+  fullscreenLyricsMode = 'side',
+  onSetFullscreenLyricsMode,
   onSpotifyImportDone,
   onRemoveFromLibrary,
   onUpdateTrackMetadata,
@@ -625,6 +627,16 @@ export default function ImmersiveLibraryPage({
   const { accent, wash, mid } = themeRgb;
   const coverUrl = focusTrack?.coverArt || null;
 
+  // Keep the OBS overlay's accent in sync with the playing cover, so the
+  // overlay (LED, glass, island) tints to match the artwork. Cheap no-op when
+  // the overlay server isn't running; the overlay preserves accent across
+  // track updates so this is the single source of truth for its tint.
+  useEffect(() => {
+    const api = typeof window !== 'undefined' ? window.electronAPI : null;
+    if (!api?.twitchSetOptions || !accent) return;
+    api.twitchSetOptions({ accent }).catch(() => { /* ignore */ });
+  }, [accent]);
+
   const progressPct = duration ? (currentTime / duration) * 100 : 0;
 
   /**
@@ -785,7 +797,7 @@ export default function ImmersiveLibraryPage({
         label: 'Remove from library',
         danger: true,
         icon: <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" /></svg>,
-        onClick: () => { onRemoveFromLibrary?.([track.id]); pushToast({ message: `Removed "${track.title || 'track'}" from library`, kind: 'info' }); },
+        onClick: () => { onRemoveFromLibrary?.([track.id]); },
       });
     }
     return items;
@@ -1305,15 +1317,13 @@ export default function ImmersiveLibraryPage({
                 same z-stack as the incoming one — both layered over the
                 fallback icon, fading reciprocally. */}
             {prevCoverUrl && prevCoverUrl !== coverUrl ? (
-              <img
+              <div
                 key={`out-${revealKey}`}
-                src={prevCoverUrl}
-                alt=""
-                decoding="async"
+                aria-hidden="true"
                 style={{
                   position: 'absolute', inset: 0,
-                  width: '100%', height: '100%', objectFit: 'cover',
-                  imageRendering: 'high-quality',
+                  backgroundImage: `url("${prevCoverUrl}")`,
+                  backgroundSize: 'cover', backgroundPosition: 'center', backgroundRepeat: 'no-repeat',
                   // Sits on top during the fade so the OLD cover is what the
                   // user sees clearly, then fades away revealing the NEW one
                   // already at opacity 1 underneath. Single fade-out feels
@@ -1326,27 +1336,16 @@ export default function ImmersiveLibraryPage({
               />
             ) : null}
             {coverUrl ? (
-              <img
+              <div
                 key={`in-${coverUrl}`}
-                src={coverUrl}
-                alt=""
-                // Force the browser into its highest-quality scaling
-                // algorithm (Lanczos in Chromium for moderate downscale
-                // ratios, falling back to bilinear). Default 'auto' may
-                // pick a faster but uglier path on some GPUs. The decode
-                // hint lets the image decode off the main thread so the
-                // UI stays responsive while big covers load.
-                decoding="async"
+                aria-hidden="true"
                 style={{
                   position: 'absolute', inset: 0,
-                  width: '100%', height: '100%', objectFit: 'cover',
+                  backgroundImage: `url("${coverUrl}")`,
+                  backgroundSize: 'cover', backgroundPosition: 'center', backgroundRepeat: 'no-repeat',
                   zIndex: 1,
-                  imageRendering: 'high-quality',
                   // Always full opacity — the outgoing cover above handles
                   // the transition by fading away from this stable base.
-                  // No animation on mount or on cover change keeps things
-                  // calm; the crossfade visual comes purely from the
-                  // outgoing layer disappearing.
                   opacity: 1,
                 }}
               />
@@ -1936,6 +1935,8 @@ export default function ImmersiveLibraryPage({
         onPreviewPlay={() => { if (isPlaying) onTogglePlay?.(); }}
         nowPlayingSliderStyle={nowPlayingSliderStyle}
         onSetNowPlayingSliderStyle={onSetNowPlayingSliderStyle}
+        fullscreenLyricsMode={fullscreenLyricsMode}
+        onSetFullscreenLyricsMode={onSetFullscreenLyricsMode}
         onSetPinnableTabsEnabled={onSetPinnableTabsEnabled}
         hiddenTabIds={hiddenTabIds}
         onSetHiddenTabIds={onSetHiddenTabIds}
@@ -2161,6 +2162,8 @@ export default function ImmersiveLibraryPage({
           artist={focusTrack?.artist}
           album={focusTrack?.album}
           accent={accent}
+          mid={mid}
+          wash={wash}
           isPlaying={isPlaying}
           currentTime={currentTime}
           duration={duration}
@@ -2178,6 +2181,10 @@ export default function ImmersiveLibraryPage({
           lyricsData={lyricsData}
           hasSyncedLyrics={hasSyncedLyrics}
           hasPlainLyrics={hasPlainLyrics}
+          analyserRef={analyserRef}
+          beatReactive={beatReactive}
+          fullscreenLyricsMode={fullscreenLyricsMode}
+          onSetFullscreenLyricsMode={onSetFullscreenLyricsMode}
           onClose={() => setCoverFullscreenOpen(false)}
         />
       ) : null}
